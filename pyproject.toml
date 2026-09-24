@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aerial-recon"
+version = "0.1.0"
+description = "Learning 3D reconstruction from aerial drone footage: classical SfM+MVS and 3D Gaussian Splatting"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "numpy>=1.26",
+  "scipy>=1.11",
+  "opencv-python-headless>=4.9",
+  "pillow>=10.0",
+  "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+colmap = ["pycolmap>=3.11"]
+mesh = ["open3d>=0.18"]
+splat = ["torch>=2.4", "gsplat>=1.5"]
+eval = ["lpips>=0.1.4", "matplotlib>=3.9"]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[project.scripts]
+aerial-recon = "aerial_recon.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aerial_recon"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+markers = ["slow: end-to-end tests that take more than a few seconds"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

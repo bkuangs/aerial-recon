@@ -1,0 +1,31 @@
+# M13 experiment matrix. Consumed by the study runner you write in M13.
+scenes:
+  brighton_beach:
+    images: data/brighton_beach/images
+    downscale: {sfm: 1600, mvs: 1600, splat: 4}
+    reference_geometry: data/brighton_beach/model.laz   # ODM pseudo-reference
+    thresholds_m: [0.05, 0.10, 0.20]
+  aukerman:
+    images: data/aukerman/images
+    downscale: {sfm: 1600, mvs: 1600, splat: 4}
+    reference_geometry: null
+    thresholds_m: [0.05, 0.10, 0.20]
+
+holdout_every: 8
+seeds: [0, 1, 2]
+
+pose_sources:
+  colmap: {command: "aerial-recon colmap {images} --out {out}"}
+  glomap: {command: "aerial-recon colmap {images} --out {out} --mapper global"}
+  vggt: {command: "see modern/pose_sources.py"}
+  # mine: {command: "aerial-recon sfm {images} --intrinsics {colmap}/sparse_txt --out {out} --five-point"}
+
+representations:
+  mvs_mesh: {depth_hypotheses: 128, window: 7, min_consistent: 2, poisson_depth: 10}
+  splat: {steps: 30000, appearance_embedding: true, pose_refinement: [false, true]}
+
+cells:
+  - {pose: colmap, repr: mvs_mesh}
+  - {pose: colmap, repr: splat}
+  - {pose: vggt, repr: mvs_mesh}
+  - {pose: vggt, repr: splat}
