@@ -44,7 +44,8 @@ def root_sift(descriptors: np.ndarray, eps: float = 1e-8) -> np.ndarray:
     Euclidean distance between RootSIFT vectors equals the Hellinger kernel on the
     originals, which matches noticeably better. Output rows have unit L2 norm.
     """
-    raise NotImplementedError("M3: implement root_sift")
+    l1 = np.sum(np.abs(descriptors), axis=1, keepdims=True)
+    return np.sqrt(descriptors / (l1 + eps))
 
 
 def match_descriptors(
@@ -64,4 +65,23 @@ def match_descriptors(
     |a - b|² = |a|² + |b|² - 2 a·b and clamp tiny negatives to zero. For large images,
     chunk the computation to bound memory.
     """
-    raise NotImplementedError("M3: implement match_descriptors")
+    if len(desc_a) == 0 or desc_b.shape[0] < 2:
+        return np.zeros((0, 2), dtype=np.int64)
+
+    aa = np.sum(desc_a**2, axis=1)[:, None]    # (Na, 1)
+    bb = np.sum(desc_b**2, axis=1)[None, :]    # (1, Nb)
+    d2 = aa + bb - 2 * desc_a @ desc_b.T       # (Na, Nb)
+    d = np.sqrt(np.maximum(d2, 0))             # clamp tiny negatives from rounding
+
+    nn = np.argsort(d, axis=1)[:, :2]
+    rows = np.arange(len(desc_a))
+    d1, d2nd = d[rows, nn[:, 0]], d[rows, nn[:, 1]]
+    keep = d1 < ratio * d2nd
+
+    # Cross-check: A match i → j is kept only if the two descriptors pick each other as nn
+    if mutual:
+        best_a_for_b = np.argmin(d, axis=0)
+        j = nn[:, 0]
+        keep &= best_a_for_b[j] == rows  
+
+    return np.column_stack([rows[keep], j[keep]]).astype(np.int64)

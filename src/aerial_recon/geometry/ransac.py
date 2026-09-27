@@ -31,7 +31,16 @@ def required_iterations(inlier_ratio: float, sample_size: int, confidence: float
     (return 10**9). Early in RANSAC, inlier_ratio ** sample_size can be ~1e-18, where
     log(1 - p) rounds to 0: use np.log1p(-p) and cap the result at 10**9.
     """
-    raise NotImplementedError("M3: implement required_iterations")
+    cap = 10**9
+    if inlier_ratio >= 1:
+        return 1
+    if inlier_ratio <= 0:
+        return cap
+    denom = np.log1p(-(inlier_ratio**sample_size))
+    if denom == 0:
+        return cap
+    n = np.ceil(np.log1p(-confidence) / denom)
+    return int(min(n, cap))
 
 
 def ransac(
@@ -60,4 +69,44 @@ def ransac(
     set grows, at most a few times). If no model is ever found, return model=None and an
     all-False mask.
     """
-    raise NotImplementedError("M3: implement ransac")
+    rng = rng if rng is not None else np.random.default_rng()
+    best_model = None
+    best_inliers = np.zeros(n_data, dtype=bool)
+    best_count = 0
+    if n_data < sample_size:
+        return RansacResult(best_model, best_inliers, 0)
+
+    budget = max_iterations
+    it = 0
+    while it < budget:
+        it += 1
+        idx = rng.choice(n_data, size=sample_size, replace=False)
+        model = fit(idx)
+        if model is None:
+            continue
+        inliers = residuals(model) < threshold
+        count = int(inliers.sum())
+        if count > best_count:
+            best_model, best_inliers, best_count = model, inliers, count
+            budget = min(max_iterations,
+                         required_iterations(count / n_data, sample_size, confidence))
+
+    if best_model is None:
+        return RansacResult(None, np.zeros(n_data, dtype=bool), it)
+
+    for _ in range(5):
+        model = fit(np.flatnonzero(best_inliers))
+        if model is None:
+            break
+        inliers = residuals(model) < threshold
+        count = int(inliers.sum())
+        # Keep the refit only if it doesn't lose support; stop once the set stops growing.
+        if count < best_count:
+            break
+        best_model, best_inliers = model, inliers
+        grew = count > best_count
+        best_count = count
+        if not grew:
+            break
+
+    return RansacResult(best_model, best_inliers, it)
