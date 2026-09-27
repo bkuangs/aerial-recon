@@ -15,6 +15,7 @@ Nistér "An Efficient Solution to the Five-Point Relative Pose Problem" (TPAMI 2
 from __future__ import annotations
 
 from dataclasses import dataclass
+from aerial_recon.geometry.homography import normalize_points
 
 import numpy as np
 
@@ -33,15 +34,44 @@ def fundamental_eight_point(x1: np.ndarray, x2: np.ndarray) -> np.ndarray:
     Normalize both point sets (homography.normalize_points), solve Af = 0 by SVD, enforce
     rank 2 by zeroing the smallest singular value, then denormalize: F = T2ᵀ F̂ T1.
     """
-    raise NotImplementedError("M4: implement fundamental_eight_point")
+    x1n, T1 = normalize_points(x1)
+    x2n, T2 = normalize_points(x2)
+    u1, v1 = x1n[:, 0:1], x1n[:, 1:2]
+    u2, v2 = x2n[:, 0:1], x2n[:, 1:2]
+
+    A = np.column_stack([
+        u2 * u1, u2 * v1, u2,
+        v2 * u1, v2 * v1, v2,
+        u1,      v1,      np.ones_like(u1),
+    ])
+    _, _, Vt = np.linalg.svd(A)
+    Fn = Vt[-1].reshape(3, 3)
+
+    U, S, Vt = np.linalg.svd(Fn)
+    S[2] = 0
+    Fn = U @ np.diag(S) @ Vt
+
+    F = T2.T @ Fn @ T1
+    return F / np.linalg.norm(F)
 
 
 def sampson_distance(F: np.ndarray, x1: np.ndarray, x2: np.ndarray) -> np.ndarray:  # noqa: N803
-    """First-order geometric error of each correspondence w.r.t. F, in pixels, shape (N,).
-
-    d² = (x2ᵀFx1)² / ((Fx1)₁² + (Fx1)₂² + (Fᵀx2)₁² + (Fᵀx2)₂²); return d (not d²).
     """
-    raise NotImplementedError("M4: implement sampson_distance")
+    Sampson distance measures the geometric error of an epipolar correspondence by 
+    measuring how far the two measured points need to move so that they satisfy the epipolar constraint.
+
+    d² = (x2ᵀFx1)² / ((Fx1)₁² + (Fx1)₂² + (Fᵀx2)₁² + (Fᵀx2)₂²); return d (not d²), in pixels, shape (N,).
+    """
+    x1h = np.column_stack([x1, np.ones(len(x1))])
+    x2h = np.column_stack([x2, np.ones(len(x2))])
+
+    Fx1 = x1h @ F.T     # row i is F @ x1[i]
+    Ftx2 = x2h @ F      # row i is F.T @ x2[i]
+
+    num = np.sum(x2h * Fx1, axis=1)     # x2ᵀ F x1 for each correspondence
+    den = Fx1[:, 0]**2 + Fx1[:, 1]**2 + Ftx2[:, 0]**2 + Ftx2[:, 1]**2
+
+    return np.abs(num) / np.sqrt(den)
 
 
 def essential_from_fundamental(F: np.ndarray, K1: np.ndarray, K2: np.ndarray) -> np.ndarray:  # noqa: N803
