@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from aerial_recon.geometry.homography import normalize_points
+from aerial_recon.geometry.triangulation import triangulate_dlt
+from aerial_recon.geometry.ransac import ransac
 
 import numpy as np
 
@@ -28,8 +30,22 @@ class RelativePose:
     F: np.ndarray | None = None
 
 
+def fit(idx):
+    return fundamental_eight_point(x1[idx], x2[idx])
+
+def residuals(F):
+    return sampson_distance(F, x1, x2)
+
+def to_norm(x, K):
+    return (np.column_stack([x, np.ones(len(x))]) @ np.linalg.inv(K).T)[:, :2]
+
+
 def fundamental_eight_point(x1: np.ndarray, x2: np.ndarray) -> np.ndarray:
-    """Normalized 8-point algorithm (N >= 8) -> F (3, 3), rank 2, Frobenius norm 1.
+    """
+    Use the normalized 8-point algorithm to recover the fundamental matrix. 
+
+    The fundamental matrix for uncalibrated cameras takes a point in one image 
+    and maps it to the corresponding EPIPOLAR LINE in the other image; not a point.
 
     Normalize both point sets (homography.normalize_points), solve Af = 0 by SVD, enforce
     rank 2 by zeroing the smallest singular value, then denormalize: F = T2ᵀ F̂ T1.
@@ -76,23 +92,59 @@ def sampson_distance(F: np.ndarray, x1: np.ndarray, x2: np.ndarray) -> np.ndarra
 
 def essential_from_fundamental(F: np.ndarray, K1: np.ndarray, K2: np.ndarray) -> np.ndarray:  # noqa: N803
     """E = K2ᵀ F K1, projected onto the essential manifold (singular values (1, 1, 0))."""
-    raise NotImplementedError("M4: implement essential_from_fundamental")
+    E = K2.T @ F @ K1
+    U, _, Vt = np.linalg.svd(E)
+    return U @ np.diag([1.0, 1.0, 0.0]) @ Vt
 
 
 def decompose_essential(E: np.ndarray) -> list[tuple[np.ndarray, np.ndarray]]:  # noqa: N803
-    """The four (R, t) candidates of E, with det(R) = +1 and |t| = 1 (HZ result 9.19)."""
-    raise NotImplementedError("M4: implement decompose_essential")
+    """
+    The essential matrix is decomposed to recover R and t between two calibrated cameras.
+
+    The decomposition gives four possible camera poses:
+    (R_1, +t), (R_1, -t), (R_2, +t), (R_2, -t)
+
+    There are two possible rotations, and translation can point in either direction.
+
+    The essential matrix itself can't tell us which one is correct; we will check which
+    of these puts the reconstructed points in front of both cameras (cheirality check).
+    """
+    U, _, Vt = np.linalg.svd(E)
+    # Flipping the sign of U or Vt only negates E (same up to scale) but makes det(R) = +1.
+    if np.linalg.det(U) < 0:
+        U = -U
+    if np.linalg.det(Vt) < 0:
+        Vt = -Vt
+
+    W = np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+    R1 = U @ W @ Vt
+    R2 = U @ W.T @ Vt
+    t = U[:, 2]     # null vector of Eᵀ, already unit length
+
+    return [(R1, t), (R1, -t), (R2, t), (R2, -t)]
 
 
 def select_pose_by_cheirality(
     candidates: list[tuple[np.ndarray, np.ndarray]], xn1: np.ndarray, xn2: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Pick the candidate that puts the most points in front of both cameras.
+    """
+    Pick the [R t] configuration that puts the most points in front of both cameras.
 
     xn1/xn2 are normalized image coordinates (N, 2). Returns (R, t, in_front_mask).
     Uses triangulation.triangulate_dlt with P1 = [I | 0], P2 = [R | t].
     """
-    raise NotImplementedError("M4: implement select_pose_by_cheirality")
+    P1 = np.hstack([np.eye(3), np.zeros((3, 1))])
+    best = None
+    for R, t in candidates:
+        P2 = np.hstack([R, t[:, None]])
+        X = triangulate_dlt(P1, P2, xn1, xn2)   # in camera-1 coordinates
+        z1 = X[:, 2]
+        z2 = (X @ R.T + t)[:, 2]
+        in_front = np.isfinite(z1) & (z1 > 0) & (z2 > 0)
+        if best is None or in_front.sum() > best[2].sum():
+            best = (R, t, in_front)
+
+    return best
 
 
 def estimate_relative_pose(
@@ -104,13 +156,31 @@ def estimate_relative_pose(
     confidence: float = 0.999,
     rng: np.random.Generator | None = None,
 ) -> RelativePose:
-    """Robust relative pose from undistorted pixel correspondences.
+    """
+    Recover the relative pose (R, t) between two cameras from noisy pixel matches.
 
-    RANSAC (M3) over fundamental_eight_point with sampson_distance < threshold_px, then
-    E from F, decompose, and choose by cheirality on the inliers.
+    This ties the whole milestone together:
+    1. RANSAC finds F: repeatedly fit fundamental_eight_point to 8 random matches and keep
+       the F with the most inliers (matches with sampson_distance < threshold_px).
+    2. Convert F to E using the intrinsics K1, K2 (essential_from_fundamental).
+    3. Decompose E into its four (R, t) candidates (decompose_essential).
+    4. Keep the candidate that puts the inlier points in front of both cameras
+       (select_pose_by_cheirality).
+
+    x1, x2 are (N, 2) matched pixel coordinates, already undistorted. t is unit length:
+    two images alone can't tell how far apart the cameras are, only in which direction.
 
     Stretch: compare against cv2.findEssentialMat (5-point + RANSAC) on real image pairs and
     against the homography model on nadir, flat-terrain pairs. When does the 8-point
     estimate break down?
     """
-    raise NotImplementedError("M4: implement estimate_relative_pose")
+    result = ransac(len(x1), 8, fit, residuals, threshold_px, confidence=confidence, rng=rng)
+    F_best, inliers = result.model, result.inliers
+
+    E = decompose_essential(F_best)
+    R, t, _ = select_pose_by_cheirality(E)
+
+    xn1, xn2 = to_norm(x1[inliers], K1), to_norm(x2[inliers], K2)
+    R, t, in_front = select_pose_by_cheirality(decompose_essential(E), xn1, xn2)
+
+    return RelativePose(R, t, inliers, F_best)
