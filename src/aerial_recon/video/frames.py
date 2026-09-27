@@ -14,6 +14,7 @@ Szeliski 2e §9.1 (optical flow); Lucas & Kanade (1981).
 from __future__ import annotations
 
 from pathlib import Path
+from scipy import ndimage
 
 import cv2
 import numpy as np
@@ -66,7 +67,15 @@ def sharpness(gray: np.ndarray) -> float:
     Implement the 3x3 Laplacian yourself (scipy.ndimage.convolve is fine; no cv2.Laplacian).
     Higher = sharper. Must be invariant to adding a constant to the image.
     """
-    raise NotImplementedError("M2: implement sharpness")
+    gray = gray.astype(np.float64)
+
+    L = np.array([
+        [0, 1, 0],
+        [1, -4, 1],
+        [0, 1, 0],
+    ])
+
+    return float(np.var(ndimage.convolve(gray, L)))
 
 
 def frame_displacement(gray_a: np.ndarray, gray_b: np.ndarray, max_corners: int = 400) -> float:
@@ -76,8 +85,30 @@ def frame_displacement(gray_a: np.ndarray, gray_b: np.ndarray, max_corners: int 
     status == 1, return the median displacement magnitude. This is a cheap parallax proxy.
     Inputs are float [0, 1] grayscale; convert to uint8 for OpenCV.
     """
-    raise NotImplementedError("M2: implement frame_displacement")
+    a8 = (gray_a * 255).astype(np.uint8)
+    b8 = (gray_b * 255).astype(np.uint8)
 
+    pts = cv2.goodFeaturesToTrack(      # Shi-Tomashi corner detection
+        a8, 
+        maxCorners=max_corners, 
+        qualityLevel=0.01, 
+        minDistance=7
+        )
+
+    if pts is None: 
+        return 0.0
+
+    # Lucas-Kanade optical flow with coarse-to-fine
+    # nxt: new position of tracked corners in frame b
+    # status: bool mask tells us whethe a corner was detected in frame b
+    nxt, status, _ = cv2.calcOpticalFlowPyrLK(a8, b8, pts, None)
+
+    ok = status.ravel() == 1    # flatten to 1D
+    if not ok.any():
+        return 0.0
+
+    # nxt - pts = motion vector
+    return float(np.median(np.linalg.norm(nxt[ok] - pts[ok], axis=-1)))     # convert vector to pixel distance
 
 def select_keyframes(
     sharpness_scores: np.ndarray,
@@ -101,4 +132,25 @@ def select_keyframes(
         3. Append the sharpest frame in [j, min(j + search_window, N)) (ties -> earliest).
         4. Repeat from step 2.
     """
-    raise NotImplementedError("M2: implement select_keyframes")
+    n = len(sharpness_scores)
+
+    # This is the reference image A. Pick the best one
+    keyframes = [int(np.argmax(sharpness_scores[:search_window]))]   # step 1
+
+    while True:
+        k = keyframes[-1]
+        total = 0.0
+        j = None
+        # Choose the first image that has moved enough
+        for m in range(k + 1, n):                   # step 2: smallest j with enough motion
+            total += displacements[m - 1]
+            if total >= min_displacement:
+                j = m
+                break
+        if j is None:
+            break
+        # But it may be blurry. Find the sharpest
+        hi = min(j + search_window, n)              # step 3: sharpest in [j, hi)
+        keyframes.append(j + int(np.argmax(sharpness_scores[j:hi])))
+
+    return keyframes
