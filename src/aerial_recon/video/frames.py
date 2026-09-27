@@ -62,9 +62,9 @@ def read_gray(path: str | Path) -> np.ndarray:
 
 
 def sharpness(gray: np.ndarray) -> float:
-    """Focus measure: variance of the Laplacian of a grayscale image.
+    """
+    Determine the sharpness of an image viahe Laplacian kernel.
 
-    Implement the 3x3 Laplacian yourself (scipy.ndimage.convolve is fine; no cv2.Laplacian).
     Higher = sharper. Must be invariant to adding a constant to the image.
     """
     gray = gray.astype(np.float64)
@@ -79,7 +79,8 @@ def sharpness(gray: np.ndarray) -> float:
 
 
 def frame_displacement(gray_a: np.ndarray, gray_b: np.ndarray, max_corners: int = 400) -> float:
-    """Median image-space motion (pixels) of tracked corners from frame a to frame b.
+    """
+    Determine the image-space motion (pixels) of tracked corners from frame a to frame b.
 
     Suggested: cv2.goodFeaturesToTrack on a, cv2.calcOpticalFlowPyrLK to b, keep points with
     status == 1, return the median displacement magnitude. This is a cheap parallax proxy.
@@ -108,7 +109,7 @@ def frame_displacement(gray_a: np.ndarray, gray_b: np.ndarray, max_corners: int 
         return 0.0
 
     # nxt - pts = motion vector
-    return float(np.median(np.linalg.norm(nxt[ok] - pts[ok], axis=-1)))     # convert vector to pixel distance
+    return float(np.median(np.linalg.norm(nxt[ok] - pts[ok], axis=-1))) # convert vector to pixel distance
 
 def select_keyframes(
     sharpness_scores: np.ndarray,
@@ -116,7 +117,9 @@ def select_keyframes(
     min_displacement: float,
     search_window: int = 5,
 ) -> list[int]:
-    """Choose frame indices that are sharp and spaced by at least `min_displacement` pixels.
+    """
+    Choose frames that are "sharp" and spaced by at least `min_displacement` pixels to
+    use for SfM.
 
     Args:
         sharpness_scores: (N,) per-frame sharpness.
