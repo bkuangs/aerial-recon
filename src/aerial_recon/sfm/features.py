@@ -54,20 +54,18 @@ def match_descriptors(
     ratio: float = 0.8,
     mutual: bool = True,
 ) -> np.ndarray:
-    """Nearest-neighbour matching with Lowe's ratio test and optional mutual check.
-
-    Returns (M, 2) int64 index pairs (i into desc_a, j into desc_b).
+    """
+    Nearest-neighbour distance ratio test with an optional mutual check.
 
     * Ratio test: keep i -> j only if d(i, nn1) < ratio * d(i, nn2) (Euclidean distances).
     * Mutual check: additionally require that i is also b[j]'s nearest neighbour in a.
 
-    Brute force with numpy is fine for a few thousand descriptors: use
-    |a - b|² = |a|² + |b|² - 2 a·b and clamp tiny negatives to zero. For large images,
-    chunk the computation to bound memory.
+    Returns (M, 2) int64 index pairs (i into desc_a, j into desc_b).
     """
     if len(desc_a) == 0 or desc_b.shape[0] < 2:
         return np.zeros((0, 2), dtype=np.int64)
 
+    # Euclidean distances
     aa = np.sum(desc_a**2, axis=1)[:, None]    # (Na, 1)
     bb = np.sum(desc_b**2, axis=1)[None, :]    # (1, Nb)
     d2 = aa + bb - 2 * desc_a @ desc_b.T       # (Na, Nb)
@@ -77,11 +75,11 @@ def match_descriptors(
     rows = np.arange(len(desc_a))
     d1, d2nd = d[rows, nn[:, 0]], d[rows, nn[:, 1]]
     keep = d1 < ratio * d2nd
+    j = nn[:, 0]
 
-    # Cross-check: A match i → j is kept only if the two descriptors pick each other as nn
+    # Cross-check: A match is kept only if the two descriptors pick each other both ways
     if mutual:
         best_a_for_b = np.argmin(d, axis=0)
-        j = nn[:, 0]
-        keep &= best_a_for_b[j] == rows  
+        keep &= best_a_for_b[j] == rows
 
     return np.column_stack([rows[keep], j[keep]]).astype(np.int64)
