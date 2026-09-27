@@ -20,12 +20,20 @@ from aerial_recon.types import Camera, Pose
 
 def distort(camera: Camera, xy: np.ndarray) -> np.ndarray:
     """Apply radial distortion to normalized coordinates (N, 2) -> distorted normalized (N, 2)."""
-    raise NotImplementedError("M1: implement distort")
+    r2 = np.sum(xy**2, axis=1, keepdims=True)
+    d = 1 + camera.k1 * r2 + camera.k2 * r2**2
+    return xy * d
 
 
 def undistort(camera: Camera, xy_distorted: np.ndarray, iterations: int = 20) -> np.ndarray:
     """Invert `distort` numerically (fixed-point iteration or Newton). (N, 2) -> (N, 2)."""
-    raise NotImplementedError("M1: implement undistort")
+    # Fixed point of xy = xy_d / d(xy); converges fast for the mild distortion of real lenses.
+    xy = xy_distorted.copy()
+    for _ in range(iterations):
+        r2 = np.sum(xy**2, axis=1, keepdims=True)
+        d = 1 + camera.k1 * r2 + camera.k2 * r2**2
+        xy = xy_distorted / d
+    return xy
 
 
 def project(camera: Camera, pose: Pose, points_world: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -34,12 +42,23 @@ def project(camera: Camera, pose: Pose, points_world: np.ndarray) -> tuple[np.nd
     Returns (uv (N, 2), depth (N,)) where depth is camera-frame Z. Points behind the camera
     still get (meaningless) pixel values; callers filter with depth > 0.
     """
-    raise NotImplementedError("M1: implement project")
+    x_cam = points_world @ pose.R.T + pose.t
+
+    xy = x_cam[:, :2] / x_cam[:, 2:]
+    xy_d = distort(camera, xy)
+
+    uv = np.column_stack([camera.fx * xy_d[:, 0] + camera.cx,
+                        camera.fy * xy_d[:, 1] + camera.cy])
+
+    return uv, x_cam[:, 2]
 
 
 def unproject(camera: Camera, pose: Pose, uv: np.ndarray, depth: np.ndarray) -> np.ndarray:
     """Pixels (N, 2) with camera-frame Z depth (N,) -> world points (N, 3). Inverse of project."""
-    raise NotImplementedError("M1: implement unproject")
+    xy = pixel_to_normalized(camera, uv)
+    x_cam = np.column_stack([xy * depth[:, None], depth])
+    # Row-vector form of R^T (x_cam - t)
+    return (x_cam - pose.t) @ pose.R
 
 
 def pixel_to_normalized(camera: Camera, uv: np.ndarray) -> np.ndarray:
@@ -47,11 +66,14 @@ def pixel_to_normalized(camera: Camera, uv: np.ndarray) -> np.ndarray:
 
     Epipolar geometry and PnP operate in this space.
     """
-    raise NotImplementedError("M1: implement pixel_to_normalized")
+    xy_d = (uv - [camera.cx, camera.cy]) / [camera.fx, camera.fy]
+    return undistort(camera, xy_d)
 
 
 def reprojection_errors(
     camera: Camera, pose: Pose, points_world: np.ndarray, uv_observed: np.ndarray
 ) -> np.ndarray:
     """Euclidean pixel distance between projected points and observations, shape (N,)."""
-    raise NotImplementedError("M1: implement reprojection_errors")
+    uv_projected, _ = project(camera, pose, points_world)
+
+    return np.linalg.norm(uv_projected - uv_observed, axis=1)
