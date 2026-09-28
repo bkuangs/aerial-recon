@@ -1,8 +1,9 @@
 # Optimizations in the classical pipeline (M4–M9)
 
 Notes from building the classical pipeline and running it on Brighton Beach (18 images) and
-Aukerman (77 images) on this machine (8 cores, ~7.7 GB RAM under WSL). Every number below
-comes from those runs. Where an effect was not isolated, that is stated.
+Aukerman (77 images) on this machine (8 cores, ~7.7 GB RAM under WSL, CPU only), and later
+on two drone-orbit videos ([last section](#video-reconstruction-drone-orbits)). Every
+number below comes from those runs. Where an effect was not isolated, that is stated.
 
 ## Summary
 
@@ -156,3 +157,86 @@ What would help, in order:
 5. **Vegetation in MVS.** This is quality rather than speed. Only ≈ 12% of tree-canopy depths
    survive fusion's cross-view check, against ≈ 65% for grass. Occlusion-robust aggregation
    (best-k source views) or PatchMatch with per-pixel view selection would address it.
+
+## Video reconstruction (drone orbits)
+
+Two 2560×1440, 60 fps orbits: `drone_roof_orbit` (8,673 frames) and
+`warehouse_drone_orbit` (8,234 frames). Pipeline: `keyframes` → COLMAP → `level` → `mvs`.
+The models have no GPS, so they are in arbitrary units.
+
+| Change | Where | Measured effect |
+|---|---|---|
+| Keyframe selection before SfM | `video/frames.py`, `keyframes` | 8,673 → 165 and 8,234 → 156 frames; exhaustive COLMAP in 13 and 8 min |
+| Two-pass decode, analysis at 640 px | `extract_keyframes` | ≈ 112 s per video (both at once), 0.3 GB RSS |
+| Fusion voxel = 4 × GSD, not 1 × | `mvs --voxel 0`, `--auto-voxel-gsd` | Roof fusion: OOM at 1 GSD → completes at 4 GSD, 4.1 GB peak, 3.9M points |
+| Buffered, sorted voxel store | `mvs/fusion.py` | Effect not isolated from the voxel change (see below) |
+| `mvs --reuse-depth` after a fusion crash | `mvs/pipeline.py` | Each retry skipped ≈ 28 min of plane sweep (twice on the roof) |
+
+### Keyframes first, then exhaustive matching
+
+Feeding every frame to SfM is out of reach on a CPU. Exhaustive matching of 8,673 frames
+would mean about 37.6M pairs. `keyframes` keeps about one frame per 0.86 s. It scores
+sharpness (Laplacian variance) and motion (median LK flow of 400 corners) on 640 px
+grayscale frames. The motion threshold is total flow / `--target`. With about 160
+keyframes, **exhaustive** matching is affordable: 13,530 pairs for the roof, with COLMAP
+taking 13 min in total and peaking at 5.0 GB. Exhaustive matching was chosen over sequential
+matching because an orbit returns to where it started. Sequential matching only closes
+that loop with vocabulary-tree loop detection, and no vocabulary tree was set up here.
+Every keyframe registered (165/165 and 156/156).
+
+The decoder runs twice. Pass 1 decodes and scores every frame at 640 px. Pass 2 calls
+`cap.grab()` for every frame and `retrieve()`s only the selected ones. Frames are written
+at 1920 px (COLMAP's `--max-size`), not 2560. The saving from the smaller output was not
+measured.
+
+### Voxel size in a scale-free model
+
+`georef` cannot run without GPS, so there is no metric voxel size. `mvs --voxel 0` uses
+`auto_voxel_gsd` × the median ground sampling distance, measured from the sparse points.
+One GSD was the Brighton/Aukerman rule, and it fails for an orbit:
+
+| Roof fusion attempt | Result |
+|---|---|
+| 1 GSD (0.004), original accumulator | OOM-killed after ≈ 14 min of fusion, 6.7 GB peak |
+| 1 GSD, buffered accumulator (below) | 5.2 GB RSS after 11 min and still rising; stopped |
+| **4 GSD (0.016)**, buffered accumulator | **completes in 16 min, 4.1 GB peak, 3.9M points** |
+
+The reason is redundancy. All 165 views see the same buildings, so each surface point is
+back-projected many times. Depth noise then spreads it through a shell many GSDs thick,
+because at these short baselines both the plane-sweep depth steps (before sub-plane
+refinement) and the 1% relative-depth tolerance of the consistency check are many GSDs
+deep. At a depth of 5 units, 1% is 0.05, or 12 GSD. At 1 GSD almost every raw point gets
+its own voxel, so voxelisation stops reducing anything. The warehouse ran at 4 GSD
+straight away: 10 min fusion, 3.6 GB peak, 2.9M points.
+
+### Buffered voxel accumulator
+
+The original accumulator ran `np.unique(..., return_inverse=True)` over the *whole* store
+after every view. That re-sorted tens of millions of keys 165 times and briefly held
+several full-size temporaries. The rewrite does three things:
+
+* Each view is reduced on its own (sort plus `np.add.reduceat`) and buffered.
+* Buffers are merged into a **sorted** store only once they reach max(4M, store / 4)
+  entries. Existing voxels are found with `np.searchsorted` and added to in place. New ones
+  are placed with `np.insert`.
+* Sums are float32 offsets from the voxel corner (sub-voxel values, so float32 is ample),
+  plus int64 keys and int32 counts: 32 B per voxel, 44 B with colour.
+
+On 2.4M random points it matched a one-shot reduction to 5e-9 in position.
+`test_voxel_accumulator_buffered_merge_matches_one_shot` checks the same property. Its own
+effect was not isolated. At 1 GSD it did not fit either, so the voxel size was the
+change that decided it.
+
+### Remaining bottlenecks (video)
+
+| Stage (roof, 165 views at 1600×900) | Time |
+|---|---|
+| Plane sweep, 4 workers | 28 min (≈ 10 s per view) |
+| Fusion consistency check + voxel merge | 16 min (≈ 6 s per view) |
+| COLMAP features + exhaustive matching + mapping | 13 min |
+
+Fusion now costs more than half as much as depth estimation. Each view reprojects every
+valid pixel into 8 neighbours in float64 NumPy, in the main process. Running it in float32
+or across the process pool are the obvious next steps (not tried). The CUDA
+paths (COLMAP matching, PatchMatch stereo) were unavailable: WSL reports
+`CUDA_ERROR_OPERATING_SYSTEM`, and the pip `pycolmap` build is CPU-only.
