@@ -66,6 +66,12 @@ list, so sync them together: `uv sync --extra colmap --extra dev --extra mesh`.
 
 ### From a drone video (no GPS)
 
+| drone_roof_orbit | warehouse_drone_orbit |
+|---|---|
+| ![drone_roof_orbit, 10 s from 1:00](docs/media/drone_roof_orbit.gif) | ![warehouse_drone_orbit, 10 s from 1:00](docs/media/warehouse_drone_orbit.gif) |
+
+*10 s of each input video starting at 1:00 (360 px, 8 fps).*
+
 ```bash
 V=warehouse_drone_orbit; O=outputs/$V
 uv run aerial-recon keyframes data/video/$V --out data/$V/images --target 180   # M2
