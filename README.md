@@ -64,6 +64,36 @@ Large clouds: add `--voxel 0.2` first (Aukerman: 20M -> 4.6M points, 4.5 GB peak
 on Brighton takes about 5.8 GB. Note that `uv sync --extra X` *removes* extras you don't
 list, so sync them together: `uv sync --extra colmap --extra dev --extra mesh`.
 
+### From a drone video (no GPS)
+
+```bash
+V=warehouse_drone_orbit; O=outputs/$V
+uv run aerial-recon keyframes data/video/$V --out data/$V/images --target 180   # M2
+uv run aerial-recon colmap data/$V/images --out $O/colmap --max-size 1920
+uv run aerial-recon level $O/colmap/sparse_txt --out $O/colmap_level            # z-up, centred
+uv run aerial-recon mvs $O/colmap_level data/$V/images --out $O/mvs --voxel 0
+uv run aerial-recon mesh $O/mvs/fused.npz --depth 10 --out $O/mvs/mesh_d10.ply
+```
+
+`keyframes` scores every frame (Laplacian sharpness, LK median flow at 640 px), sets the
+motion threshold to total flow / `--target`, and writes the chosen frames at 1920 px.
+Video frames carry no EXIF GPS, so `georef` cannot run; `level` instead rotates the model
+so up is +z (a gimballed camera has ~zero roll, so up is orthogonal to every camera
+x-axis) and moves the origin to the median sparse point. Units stay arbitrary, so
+`mvs --voxel 0` picks the voxel as `--auto-voxel-gsd` (4) × the median ground sampling
+distance. One GSD is too fine for a dense orbit: 165 views of one scene put nearly every
+raw point in its own voxel and fusion ran out of RAM.
+
+Results on the two 2560×1440 60 fps orbits in `data/video` (CPU only, MVS at 1600×900):
+
+| video | keyframes | COLMAP registered / points / reproj. | COLMAP | MVS depth + fusion | fused points |
+|---|---|---|---|---|---|
+| drone_roof_orbit | 165 of 8673 | 165 / 138k / 0.56 px | 13 min | 28 + 16 min | 3.9M |
+| warehouse_drone_orbit | 156 of 8234 | 156 / 55k / 0.72 px | 8 min | 24 + 10 min | 2.9M |
+
+Both levelled orbits have camera-height spread under 5 % of the height above the
+scene and |roll| under 1.3°, a good sign that the up estimate is right.
+
 ## How to work a milestone
 
 1. Read the milestone in [docs/roadmap.md](docs/roadmap.md) and its reading in
@@ -110,6 +140,7 @@ src/aerial_recon/
   video/frames.py    extraction (scaffold); sharpness, keyframes     (M2)
   sfm/               SIFT (scaffold), matching, tracks, BA, incremental, COLMAP ref
   geo/geodesy.py     WGS84 → ECEF → ENU                              (M7)
+  geo/level.py       z-up levelling without GPS (video)
   mvs/               warp (scaffold), plane sweep, PatchMatch, fusion, meshing (scaffold)
   modern/            pose sources (scaffold), gsplat trainer         (M10-M11)
   eval/              pose, geometry, image metrics

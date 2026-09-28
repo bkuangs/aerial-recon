@@ -136,54 +136,102 @@ def fuse_depth_maps(
 _OFF = 1 << 20  # voxel index offset: +-1M voxels per axis
 
 
-def _voxel_keys(points: np.ndarray, voxel_size: float) -> np.ndarray:
-    idx = np.floor(points / voxel_size).astype(np.int64) + _OFF
+_MASK = (1 << 21) - 1
+
+
+def _voxel_keys_from_index(idx: np.ndarray) -> np.ndarray:
+    idx = idx + _OFF
     return (idx[:, 0] << 42) | (idx[:, 1] << 21) | idx[:, 2]
 
 
 class _VoxelAccumulator:
-    """Streaming per-voxel sums so large scenes never hold every raw point in memory."""
+    """Streaming per-voxel sums so large scenes never hold every raw point in memory.
 
-    def __init__(self, voxel_size: float) -> None:
+    Each view is reduced on its own and buffered; buffers are merged into the sorted store
+    only when they grow large, so the store is not re-sorted once per view. Sums are kept
+    relative to the voxel corner in float32 (sub-voxel offsets, so precision is ample),
+    which with int64 keys and int32 counts costs 32 bytes per voxel (+12 with colors).
+    """
+
+    def __init__(self, voxel_size: float, flush_points: int = 4_000_000) -> None:
         self.voxel_size = voxel_size
+        self.flush_points = flush_points
         self.keys = np.zeros(0, dtype=np.int64)
-        self.sums: np.ndarray | None = None  # float64 point sums, float32 color sums
+        self.pts = np.zeros((0, 3), dtype=np.float32)
+        self.cols: np.ndarray | None = None
         self.counts = np.zeros(0, dtype=np.int32)
+        self._buffer: list[tuple] = []
+        self._buffered = 0
+        self._has_colors: bool | None = None
 
     def add(self, points: np.ndarray, colors: np.ndarray | None) -> None:
         if len(points) == 0:
             return
-        # Reduce the new points on their own first, then merge with the running totals, so
-        # the large arrays are only concatenated once per view.
-        keys, vals, counts = self._reduce(_voxel_keys(points, self.voxel_size), points,
-                                          colors, np.ones(len(points), dtype=np.int32))
-        if self.sums is not None:
-            keys = np.concatenate([self.keys, keys])
-            vals = [np.concatenate([a, b]) for a, b in zip(self.sums, vals, strict=True)]
-            counts = np.concatenate([self.counts, counts])
-            keys, vals, counts = self._reduce(keys, vals[0], vals[1], counts)
-        self.keys, self.sums, self.counts = keys, vals, counts
+        if self._has_colors is None:
+            self._has_colors = colors is not None
+        idx = np.floor(points / self.voxel_size).astype(np.int64)
+        offsets = (points - idx * self.voxel_size).astype(np.float32)
+        keys = _voxel_keys_from_index(idx)
+        del idx
+        cols = None if colors is None else np.asarray(colors, dtype=np.float32)
+        red = self._reduce(keys, offsets, cols, np.ones(len(keys), dtype=np.int32))
+        self._buffer.append(red)
+        self._buffered += len(red[0])
+        if self._buffered >= max(self.flush_points, len(self.keys) // 4):
+            self._flush()
 
     @staticmethod
-    def _reduce(keys, points, colors, counts):
-        uniq, inverse = np.unique(keys, return_inverse=True)
-        inverse = inverse.ravel()
-        n = len(uniq)
-        pts = np.column_stack([np.bincount(inverse, weights=points[:, c], minlength=n)
-                               for c in range(3)])
-        cols = None
-        if colors is not None:
-            cols = np.column_stack([np.bincount(inverse, weights=colors[:, c], minlength=n)
-                                    for c in range(colors.shape[1])]).astype(np.float32)
-        cnt = np.bincount(inverse, weights=counts, minlength=n).astype(np.int32)
-        return uniq, [pts, cols], cnt
+    def _reduce(keys, pts, cols, counts):
+        order = np.argsort(keys, kind="stable")
+        keys = keys[order]
+        starts = np.flatnonzero(np.r_[True, keys[1:] != keys[:-1]])
+        uniq = keys[starts]
+        pts = np.add.reduceat(pts[order], starts, axis=0, dtype=np.float32)
+        if cols is not None:
+            cols = np.add.reduceat(cols[order], starts, axis=0, dtype=np.float32)
+        counts = np.add.reduceat(counts[order], starts).astype(np.int32)
+        return uniq, pts, cols, counts
+
+    def _flush(self) -> None:
+        if not self._buffer:
+            return
+        parts = self._buffer
+        self._buffer, self._buffered = [], 0
+        keys = np.concatenate([b[0] for b in parts])
+        pts = np.concatenate([b[1] for b in parts])
+        cols = np.concatenate([b[2] for b in parts]) if self._has_colors else None
+        counts = np.concatenate([b[3] for b in parts])
+        del parts
+        keys, pts, cols, counts = self._reduce(keys, pts, cols, counts)
+        if self._has_colors and self.cols is None:
+            self.cols = np.zeros((0, cols.shape[1]), dtype=np.float32)
+        # Merge into the sorted store: add in place where the voxel exists, insert the rest.
+        pos = np.searchsorted(self.keys, keys)
+        hit = np.zeros(len(keys), dtype=bool)
+        inside = pos < len(self.keys)
+        hit[inside] = self.keys[pos[inside]] == keys[inside]
+        at = pos[hit]
+        self.pts[at] += pts[hit]
+        self.counts[at] += counts[hit]
+        if cols is not None:
+            self.cols[at] += cols[hit]
+        miss = ~hit
+        where = pos[miss]
+        self.keys = np.insert(self.keys, where, keys[miss])
+        self.pts = np.insert(self.pts, where, pts[miss], axis=0)
+        self.counts = np.insert(self.counts, where, counts[miss])
+        if cols is not None:
+            self.cols = np.insert(self.cols, where, cols[miss], axis=0)
 
     def result(self) -> tuple[np.ndarray, np.ndarray | None]:
-        if self.sums is None:
+        self._flush()
+        if len(self.keys) == 0:
             return np.zeros((0, 3)), None
-        pts, cols = self.sums
-        n = self.counts[:, None]
-        return pts / n, (None if cols is None else cols / n)
+        n = self.counts[:, None].astype(np.float64)
+        idx = np.column_stack([(self.keys >> 42) & _MASK, (self.keys >> 21) & _MASK,
+                               self.keys & _MASK]) - _OFF
+        pts = idx * self.voxel_size + self.pts / n
+        return pts, (None if self.cols is None else self.cols / n)
 
 
 def voxel_downsample(

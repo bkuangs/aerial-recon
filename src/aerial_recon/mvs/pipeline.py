@@ -36,7 +36,8 @@ class MVSOptions:
     fusion_neighbors: int = 8
     max_reprojection_px: float = 1.0
     max_relative_depth: float = 0.01
-    voxel_size: float = 0.05
+    voxel_size: float = 0.05  # <= 0: auto, auto_voxel_gsd x median ground sampling distance
+    auto_voxel_gsd: float = 4.0
     workers: int = 4
     reuse_depth: bool = False  # load depth/<name>.npz from a previous run instead of sweeping
 
@@ -118,6 +119,24 @@ def depth_range(recon: Reconstruction, image_id: int) -> tuple[float, float] | N
     return 0.8 * lo, 1.25 * hi
 
 
+def ground_sampling_distance(recon: Reconstruction, cams: dict[int, Camera]) -> float:
+    """Median footprint of one pixel on the sparse points, in model units. Lets `voxel_size`
+    follow the scene scale when the model is not metric (e.g. video without GPS)."""
+    gsd = []
+    for iid, cam in cams.items():
+        im = recon.images[iid]
+        pids = [p for p in im.point3d_ids if p >= 0 and p in recon.points]
+        if len(pids) < 10:
+            continue
+        z = im.pose.transform(np.stack([recon.points[p].xyz for p in pids]))[:, 2]
+        z = z[z > 0]
+        if len(z):
+            gsd.append(float(np.median(z)) / cam.fx)
+    if not gsd:
+        raise ValueError("no sparse points to estimate the ground sampling distance")
+    return float(np.median(gsd))
+
+
 def _sweep_job(args):
     ref, ref_cam, ref_pose, srcs, src_cams, src_poses, depths, window = args
     return plane_sweep_depth(ref, ref_cam, ref_pose, srcs, src_cams, src_poses, depths, window)
@@ -142,6 +161,11 @@ def run_mvs(recon: Reconstruction, image_dir: str | Path, out_dir: str | Path,
         poses[iid] = im.pose
     cam0 = cams[ids[0]]
     log(f"loaded {len(ids)} views at {cam0.width}x{cam0.height} ({time.time() - t0:.0f}s)")
+    if opt.voxel_size <= 0:
+        gsd = ground_sampling_distance(recon, cams)
+        opt.voxel_size = opt.auto_voxel_gsd * gsd
+        log(f"auto voxel size = {opt.auto_voxel_gsd:g} x median GSD ({gsd:.4g}) = "
+            f"{opt.voxel_size:.4g} model units")
 
     k = max(opt.num_sources, opt.fusion_neighbors)
     neighbors = view_neighbors(recon, ids, k)

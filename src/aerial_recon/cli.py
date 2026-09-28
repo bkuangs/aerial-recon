@@ -77,6 +77,22 @@ def _extract_frames(args: argparse.Namespace) -> int:
     return 0
 
 
+def _keyframes(args: argparse.Namespace) -> int:
+    """M2 deliverable: video -> sharp, parallax-spaced keyframes for SfM."""
+    import json
+
+    from aerial_recon.video.frames import extract_keyframes
+
+    paths, stats = extract_keyframes(args.video, args.out, target=args.target,
+                                     min_displacement=args.min_displacement,
+                                     analysis_width=args.analysis_width,
+                                     resize_width=args.width, search_window=args.window,
+                                     stride=args.stride)
+    (args.out.parent / f"{args.out.name}_keyframes.json").write_text(json.dumps(stats, indent=2))
+    print(f"wrote {len(paths)} keyframes to {args.out}")
+    return 0
+
+
 def _colmap(args: argparse.Namespace) -> int:
     from aerial_recon.sfm.reference import run_colmap
 
@@ -232,6 +248,25 @@ def _georef(args: argparse.Namespace) -> int:
     return 0
 
 
+def _level(args: argparse.Namespace) -> int:
+    """No-GPS alternative to georef: z-up from camera roll ≈ 0, origin at the scene."""
+    import json
+
+    from aerial_recon.geo.level import level_reconstruction
+    from aerial_recon.io.colmap_text import write_model
+    from aerial_recon.modern.pose_sources import load_poses
+
+    recon = load_poses(args.model)
+    summary = level_reconstruction(recon, scale=args.scale)
+    write_model(recon, args.out)
+    (args.out / "level.json").write_text(json.dumps(summary, indent=2))
+    print(f"levelled {summary['num_images']} images: camera height "
+          f"{summary['median_camera_height']:.3f} (std {summary['camera_height_std']:.3f}), "
+          f"|roll| median {summary['median_abs_roll_deg']:.2f}° max "
+          f"{summary['max_abs_roll_deg']:.2f}°")
+    return 0
+
+
 def _mvs(args: argparse.Namespace) -> int:
     """M8-M9 deliverable: model + images -> depth maps -> fused PLY (+ Poisson mesh)."""
     from aerial_recon.modern.pose_sources import load_poses
@@ -241,7 +276,8 @@ def _mvs(args: argparse.Namespace) -> int:
     opt = MVSOptions(max_image_size=args.max_size, num_sources=args.sources,
                      depth_hypotheses=args.hypotheses, window=args.window,
                      min_score=args.min_score, min_consistent=args.min_consistent,
-                     voxel_size=args.voxel, workers=args.workers,
+                     voxel_size=args.voxel, auto_voxel_gsd=args.auto_voxel_gsd,
+                     workers=args.workers,
                      reuse_depth=args.reuse_depth)
     summary = run_mvs(recon, args.images, args.out, opt)
     print(f"{summary['num_points']} fused points from {summary['num_views']} views in "
@@ -358,6 +394,20 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--width", type=int, help="resize frames to this width")
     p.set_defaults(handler=_extract_frames)
 
+    p = sub.add_parser("keyframes", help="video -> sharp keyframes spaced by parallax (M2)")
+    p.add_argument("video", type=Path)
+    p.add_argument("--out", type=Path, required=True)
+    motion = p.add_mutually_exclusive_group()
+    motion.add_argument("--target", type=int, default=150,
+                        help="approximate number of keyframes (sets the motion threshold)")
+    motion.add_argument("--min-displacement", type=float,
+                        help="motion between keyframes in px at --analysis-width")
+    p.add_argument("--analysis-width", type=int, default=640)
+    p.add_argument("--width", type=int, default=1920, help="output width (downscale only)")
+    p.add_argument("--window", type=int, default=9, help="sharpest-frame search window")
+    p.add_argument("--stride", type=int, default=1, help="analyse every n-th frame")
+    p.set_defaults(handler=_keyframes)
+
     p = sub.add_parser("colmap", help="reference reconstruction with COLMAP / GLOMAP")
     p.add_argument("images", type=Path)
     p.add_argument("--out", type=Path, required=True)
@@ -399,6 +449,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--out", type=Path, required=True)
     p.set_defaults(handler=_georef)
 
+    p = sub.add_parser("level", help="z-up + centre a model without GPS (e.g. video frames)")
+    p.add_argument("model", type=Path, help="COLMAP-format model (text or binary)")
+    p.add_argument("--out", type=Path, required=True)
+    p.add_argument("--scale", type=float, default=1.0, help="multiply the model by this")
+    p.set_defaults(handler=_level)
+
     p = sub.add_parser("mvs", help="plane-sweep MVS + fusion: model + images -> fused PLY")
     p.add_argument("model", type=Path)
     p.add_argument("images", type=Path)
@@ -409,7 +465,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--window", type=int, default=7)
     p.add_argument("--min-score", type=float, default=0.5, help="min winning mean ZNCC")
     p.add_argument("--min-consistent", type=int, default=2)
-    p.add_argument("--voxel", type=float, default=0.05, help="fusion voxel size (model units)")
+    p.add_argument("--voxel", type=float, default=0.05,
+                   help="fusion voxel size (model units); <= 0 = auto from the GSD")
+    p.add_argument("--auto-voxel-gsd", type=float, default=4.0,
+                   help="auto voxel = this x median ground sampling distance (--voxel 0)")
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--reuse-depth", action="store_true",
                    help="reuse depth maps already in OUT/depth (e.g. after a crash in fusion)")

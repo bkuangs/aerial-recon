@@ -72,3 +72,81 @@ def test_icp_and_vertical_offset_recover_shift():
     init = Sim3(1.0, np.eye(3), np.array([0.0, 0.0, -vertical_offset(moved, ref)]))
     T = icp(moved, ref, init=init)
     np.testing.assert_allclose(T.apply(moved), ref, atol=0.05)
+
+
+def test_voxel_accumulator_buffered_merge_matches_one_shot():
+    from aerial_recon.mvs.fusion import _VoxelAccumulator
+
+    rng = np.random.default_rng(1)
+    chunks = [(rng.normal(size=(5000, 3)) * 2 - 7, rng.uniform(0, 255, (5000, 3)))
+              for _ in range(9)]
+    acc = _VoxelAccumulator(0.2, flush_points=7000)  # forces several store merges
+    for p, c in chunks:
+        acc.add(p, c)
+    got, got_cols = acc.result()
+    ref, ref_cols = voxel_downsample(np.concatenate([p for p, _ in chunks]),
+                                     np.concatenate([c for _, c in chunks]), 0.2)
+
+    def by_voxel(points, cols):
+        keys = np.floor(points / 0.2).astype(np.int64)
+        order = np.lexsort(keys.T[::-1])
+        return keys[order], points[order], cols[order]
+
+    k1, p1, c1 = by_voxel(got, got_cols)
+    k2, p2, c2 = by_voxel(ref, ref_cols)
+    np.testing.assert_array_equal(k1, k2)
+    np.testing.assert_allclose(p1, p2, atol=1e-5)
+    np.testing.assert_allclose(c1, c2, atol=1e-3)
+
+
+def test_level_reconstruction_makes_orbit_z_up():
+    from aerial_recon.geo.level import level_reconstruction
+    from aerial_recon.geometry.alignment import transform_reconstruction
+    from aerial_recon.types import Image, Point3D, Pose, Reconstruction
+
+    rng = np.random.default_rng(2)
+    recon = Reconstruction()
+    for i, az in enumerate(np.linspace(0, 2 * np.pi, 24, endpoint=False)):
+        center = np.array([30 * np.cos(az), 30 * np.sin(az), 20.0])
+        f = -center / np.linalg.norm(center)  # look at the origin, zero roll
+        x = np.cross(f, [0, 0, 1.0])
+        x /= np.linalg.norm(x)
+        y = np.cross(f, x)
+        recon.images[i + 1] = Image(i + 1, 1, f"{i}.jpg",
+                                    pose=Pose.from_center(np.stack([x, y, f]), center))
+    for j, xyz in enumerate(rng.uniform(-10, 10, (200, 3)) * [1, 1, 0.1]):
+        recon.points[j + 1] = Point3D(xyz)
+    tilt = Rotation.from_rotvec([0.4, -0.7, 1.1]).as_matrix()
+    transform_reconstruction(recon, Sim3(0.37, tilt, np.array([5.0, -2.0, 1.0])))
+
+    summary = level_reconstruction(recon)
+    centers = np.stack([im.pose.center for im in recon.images.values()])
+    assert np.std(centers[:, 2]) < 1e-6  # orbit plane is horizontal again
+    assert summary["median_camera_height"] == pytest.approx(0.37 * 20, abs=0.1)
+    assert summary["max_abs_roll_deg"] < 1e-6
+
+
+def test_extract_keyframes_from_panning_video(tmp_path):
+    import cv2
+
+    from aerial_recon.video.frames import extract_keyframes
+
+    rng = np.random.default_rng(3)
+    texture = cv2.GaussianBlur(rng.uniform(0, 255, (240, 1200)).astype(np.uint8), (0, 0), 2)
+    path = tmp_path / "pan.avi"
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"MJPG"), 30, (320, 240))
+    if not writer.isOpened():
+        pytest.skip("no MJPG writer in this OpenCV build")
+    for i in range(120):  # 4 px / frame pan, 476 px total
+        frame = texture[:, 4 * i:4 * i + 320]
+        writer.write(cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR))
+    writer.release()
+    paths, stats = extract_keyframes(path, tmp_path / "kf", min_displacement=40,
+                                     analysis_width=320, resize_width=None, search_window=3,
+                                     log=lambda _: None)
+    assert stats["frames"] == 120
+    assert stats["total_displacement_px"] == pytest.approx(476, rel=0.05)
+    assert 10 <= len(paths) <= 12
+    assert all(p.exists() for p in paths)
+    gaps = np.diff(stats["keyframes"])
+    assert gaps.min() >= 9 and gaps.max() <= 13

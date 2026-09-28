@@ -157,3 +157,90 @@ def select_keyframes(
         keyframes.append(j + int(np.argmax(sharpness_scores[j:hi])))
 
     return keyframes
+
+
+def extract_keyframes(
+    video_path: str | Path,
+    out_dir: str | Path,
+    target: int | None = 150,
+    min_displacement: float | None = None,
+    analysis_width: int = 640,
+    resize_width: int | None = 1920,
+    search_window: int = 9,
+    stride: int = 1,
+    jpeg_quality: int = 95,
+    log=print,
+) -> tuple[list[Path], dict]:
+    """Video -> sharp keyframes with roughly uniform parallax.
+
+    Pass 1 decodes every `stride`-th frame at `analysis_width`, scoring sharpness and the
+    LK median displacement to the previous analysed frame. `select_keyframes` then picks
+    the frames; `min_displacement` (px at analysis width) defaults to total motion / target.
+    Pass 2 re-decodes and writes only the selected frames as JPEG. Returns (paths, stats).
+    """
+    video_path, out_dir = Path(video_path), Path(out_dir)
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise FileNotFoundError(f"cannot open video {video_path}")
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_ids, scores, disps = [], [], []
+    prev = None
+    index = 0
+    while True:
+        ok = cap.grab()
+        if not ok:
+            break
+        if index % stride == 0:
+            _, frame = cap.retrieve()
+            h = round(frame.shape[0] * analysis_width / frame.shape[1])
+            small = cv2.resize(frame, (analysis_width, h), interpolation=cv2.INTER_AREA)
+            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+            scores.append(sharpness(gray))
+            if prev is not None:
+                disps.append(frame_displacement(prev, gray))
+            prev = gray
+            frame_ids.append(index)
+            if len(frame_ids) % 1000 == 0:
+                log(f"  analysed {index} frames")
+        index += 1
+    cap.release()
+    num_frames = index
+    scores_a, disps_a = np.asarray(scores), np.asarray(disps)
+    total = float(disps_a.sum())
+    if min_displacement is None:
+        if not target:
+            raise ValueError("give target or min_displacement")
+        min_displacement = total / target
+    picked = select_keyframes(scores_a, disps_a, min_displacement, search_window)
+    wanted = {frame_ids[i] for i in picked}
+    log(f"{len(frame_ids)} frames analysed, total motion {total:.0f} px, threshold "
+        f"{min_displacement:.1f} px -> {len(picked)} keyframes")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cap = cv2.VideoCapture(str(video_path))
+    paths: list[Path] = []
+    index = 0
+    last = max(wanted)
+    while index <= last:
+        ok = cap.grab()
+        if not ok:
+            break
+        if index in wanted:
+            _, frame = cap.retrieve()
+            if resize_width is not None and frame.shape[1] > resize_width:
+                h = round(frame.shape[0] * resize_width / frame.shape[1])
+                frame = cv2.resize(frame, (resize_width, h), interpolation=cv2.INTER_AREA)
+            path = out_dir / f"frame_{index:06d}.jpg"
+            cv2.imwrite(str(path), frame, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
+            paths.append(path)
+        index += 1
+    cap.release()
+    stats = {
+        "video": str(video_path), "fps": fps, "frames": num_frames,
+        "analysed": len(frame_ids), "stride": stride,
+        "analysis_width": analysis_width, "total_displacement_px": total,
+        "min_displacement_px": float(min_displacement), "keyframes": [frame_ids[i] for i in picked],
+        "keyframe_sharpness": [float(scores_a[i]) for i in picked],
+        "median_sharpness_all": float(np.median(scores_a)),
+    }
+    return paths, stats
