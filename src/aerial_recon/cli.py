@@ -102,28 +102,55 @@ def _sfm(args: argparse.Namespace) -> int:
     paths = sorted(p for p in Path(args.images).iterdir()
                    if p.suffix.lower() in {".jpg", ".jpeg", ".png"})
     images, descriptors = {}, {}
-    for image_id, path in enumerate(paths, start=1):
-        gray = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
-        factor = min(1.0, args.max_size / max(gray.shape))
-        if factor < 1.0:
-            gray = cv2.resize(gray, None, fx=factor, fy=factor, interpolation=cv2.INTER_AREA)
-        kps, desc = detect_sift(gray, max_features=args.max_features)
-        images[image_id] = Image(image_id, 1, path.name, keypoints=kps / factor)
-        descriptors[image_id] = root_sift(desc)
-        print(f"[{image_id}/{len(paths)}] {path.name}: {len(kps)} features", flush=True)
+    cache = args.cache
+    cached = None
+    if cache is not None and cache.exists():
+        cached = np.load(cache, allow_pickle=False)
+        if [str(n) for n in cached["names"]] != [p.name for p in paths]:
+            print(f"cache {cache} is for a different image set; ignoring it")
+            cached = None
+    if cached is not None:
+        for image_id, path in enumerate(paths, start=1):
+            images[image_id] = Image(image_id, 1, path.name,
+                                     keypoints=cached[f"kp_{image_id}"])
+        print(f"loaded keypoints for {len(paths)} images from {cache}")
+    else:
+        for image_id, path in enumerate(paths, start=1):
+            gray = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+            factor = min(1.0, args.max_size / max(gray.shape))
+            if factor < 1.0:
+                gray = cv2.resize(gray, None, fx=factor, fy=factor,
+                                  interpolation=cv2.INTER_AREA)
+            kps, desc = detect_sift(gray, max_features=args.max_features)
+            images[image_id] = Image(image_id, 1, path.name, keypoints=kps / factor)
+            descriptors[image_id] = root_sift(desc)
+            print(f"[{image_id}/{len(paths)}] {path.name}: {len(kps)} features", flush=True)
 
     ids = sorted(images)
     pairs = [(a, b) for i, a in enumerate(ids) for b in ids[i + 1:]
              if args.sequential <= 0 or b - a <= args.sequential]
     matches = {}
-    for a, b in pairs:
-        m = match_descriptors(descriptors[a], descriptors[b])
-        if len(m) >= 15:
-            matches[(a, b)] = m
+    if cached is not None:
+        for a, b in pairs:
+            key = f"m_{a}_{b}"
+            if key in cached:
+                matches[(a, b)] = cached[key]
+    else:
+        for n, (a, b) in enumerate(pairs, start=1):
+            m = match_descriptors(descriptors[a], descriptors[b])
+            if len(m) >= 15:
+                matches[(a, b)] = m
+            if n % 100 == 0:
+                print(f"  matched {n}/{len(pairs)} pairs", flush=True)
+        if cache is not None:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(cache, names=np.array([p.name for p in paths]),
+                                **{f"kp_{i}": images[i].keypoints for i in ids},
+                                **{f"m_{a}_{b}": m for (a, b), m in matches.items()})
     print(f"{len(matches)} / {len(pairs)} pairs with >= 15 matches")
     solver = "five_point_opencv" if args.five_point else "eight_point"
     recon = IncrementalSfM({1: camera}, images, matches,
-                           SfMOptions(relative_pose_solver=solver)).run()
+                           SfMOptions(relative_pose_solver=solver, verbose=True)).run()
     write_model(recon, args.out)
     print(recon.summary())
     print(f"mean inlier matches per pair: {np.mean([len(m) for m in matches.values()]):.0f}")
@@ -152,6 +179,118 @@ def _compare_poses(args: argparse.Namespace) -> int:
     print("pairwise AUC " + "  ".join(f"@{t:g}°={a:.3f}" for t, a in zip(thresholds, aucs,
                                                                           strict=True)))
     print(f"median rotation error {np.median(rot):.3f}°, translation {np.median(trans):.3f}°")
+    if args.json:
+        import json
+
+        payload = {
+            "registered_estimate": len(est_by_name), "registered_reference": len(ref_by_name),
+            "common": len(common), "ate_rmse": ate.rmse, "ate_median": ate.median,
+            "ate_max": ate.max, "sim3_scale": ate.scale,
+            "auc": {f"{t:g}": a for t, a in zip(thresholds, aucs, strict=True)},
+            "median_rotation_error_deg": float(np.median(rot)),
+            "median_translation_error_deg": float(np.median(trans)),
+        }
+        args.json.parent.mkdir(parents=True, exist_ok=True)
+        args.json.write_text(json.dumps(payload, indent=2))
+    return 0
+
+
+def _georef(args: argparse.Namespace) -> int:
+    """M7 gate: EXIF GPS -> ENU -> Sim3 from camera centers."""
+    from aerial_recon.geo.georef import georeference, write_georef
+    from aerial_recon.io.colmap_text import write_model
+    from aerial_recon.modern.pose_sources import load_poses
+
+    recon = load_poses(args.model)
+    result = georeference(recon, args.images)
+    write_model(recon, args.out)
+    summary = write_georef(result, args.out / "georef.json")
+    print(f"georeferenced {summary['num_images']} images, scale {summary['scale']:.4f}")
+    print(f"GPS residuals: rmse 3D {summary['rmse_3d_m']:.2f} m, horizontal "
+          f"{summary['rmse_horizontal_m']:.2f} m, vertical {summary['rmse_vertical_m']:.2f} m, "
+          f"max {summary['max_3d_m']:.2f} m")
+    slope = summary.get("vertical_residual_vs_radius_slope")
+    if slope is not None:
+        print(f"vertical residual vs radius slope {slope:+.4f} m/m (doming check), planar "
+              f"trend R² (E, N, U) = "
+              + ", ".join(f"{v:.2f}" for v in summary["residual_planar_trend_r2_enu"]))
+    return 0
+
+
+def _mvs(args: argparse.Namespace) -> int:
+    """M8-M9 deliverable: model + images -> depth maps -> fused PLY (+ Poisson mesh)."""
+    from aerial_recon.modern.pose_sources import load_poses
+    from aerial_recon.mvs.pipeline import MVSOptions, run_mvs
+
+    recon = load_poses(args.model)
+    opt = MVSOptions(max_image_size=args.max_size, num_sources=args.sources,
+                     depth_hypotheses=args.hypotheses, window=args.window,
+                     min_score=args.min_score, min_consistent=args.min_consistent,
+                     voxel_size=args.voxel, workers=args.workers)
+    summary = run_mvs(recon, args.images, args.out, opt)
+    print(f"{summary['num_points']} fused points from {summary['num_views']} views in "
+          f"{summary['seconds']:.0f}s -> {args.out / 'fused.ply'}")
+    if args.mesh:
+        try:
+            import numpy as np
+
+            from aerial_recon.mvs.meshing import poisson_mesh, write_mesh
+        except ImportError:
+            print("meshing needs open3d: uv sync --extra mesh", file=sys.stderr)
+            return 1
+        data = np.load(args.out / "fused.npz")
+        mesh = poisson_mesh(data["points"], data["colors"], depth=args.poisson_depth)
+        write_mesh(args.out / "mesh.ply", mesh)
+        print(f"mesh -> {args.out / 'mesh.ply'}")
+    return 0
+
+
+def _load_points(path: Path):
+    import numpy as np
+
+    from aerial_recon.io.ply import read_ply_points
+
+    if path.suffix == ".npz":
+        return np.load(path)["points"].astype(np.float64)
+    return read_ply_points(path)
+
+
+def _eval_geometry(args: argparse.Namespace) -> int:
+    """M9 gate: precision / recall / F-score of a fused cloud against a reference."""
+    import json
+
+    from aerial_recon.eval.reference import evaluate_against_reference, load_laz_enu
+    from aerial_recon.geo.georef import read_ref_lla
+
+    pred = _load_points(args.prediction)
+    if args.reference.suffix.lower() in {".laz", ".las"}:
+        if args.georef is None:
+            print("--georef georef.json is required to put a LAS/LAZ reference in ENU",
+                  file=sys.stderr)
+            return 2
+        reference, _ = load_laz_enu(args.reference, read_ref_lla(args.georef))
+    else:
+        reference = _load_points(args.reference)
+    metrics = evaluate_against_reference(pred, reference, args.thresholds,
+                                         use_icp=not args.no_icp)
+    print(f"prediction {metrics['num_pred']} points ({metrics['num_pred_in_footprint']} in "
+          f"reference footprint), reference {metrics['num_reference']} points")
+    if "icp" in metrics:
+        icp = metrics["icp"]
+        print("ICP refinement of GPS alignment: translation "
+              + " ".join(f"{v:+.2f}" for v in icp["translation_m"])
+              + f" m, rotation {icp['rotation_deg']:.3f}°")
+    for key in ("gps_aligned", "icp_aligned"):
+        if key not in metrics:
+            continue
+        print(f"{key}:")
+        for tau, m in metrics[key].items():
+            print(f"  τ={float(tau) * 100:>4.0f} cm  P {m['precision']:.3f}  R {m['recall']:.3f}  "
+                  f"F {m['fscore']:.3f}  acc {m['accuracy']:.3f} m  "
+                  f"comp {m['completeness']:.3f} m")
+    if args.out:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(json.dumps(metrics, indent=2))
     return 0
 
 
@@ -195,12 +334,46 @@ def main(argv: list[str] | None = None) -> int:
                    help="use OpenCV's 5-point essential solver for pair verification")
     p.add_argument("--sequential", type=int, default=0,
                    help="only match images within this index distance (0 = exhaustive)")
+    p.add_argument("--cache", type=Path,
+                   help="npz cache of keypoints + raw matches (created if missing)")
     p.set_defaults(handler=_sfm)
 
     p = sub.add_parser("compare-poses", help="evaluate a COLMAP-format model against a reference")
     p.add_argument("estimate", type=Path)
     p.add_argument("reference", type=Path)
+    p.add_argument("--json", type=Path, help="also write the metrics to this JSON file")
     p.set_defaults(handler=_compare_poses)
+
+    p = sub.add_parser("georef", help="GPS-align a model into local ENU metres (M7 gate)")
+    p.add_argument("model", type=Path, help="COLMAP-format model (text or binary)")
+    p.add_argument("images", type=Path, help="image directory with EXIF GPS")
+    p.add_argument("--out", type=Path, required=True)
+    p.set_defaults(handler=_georef)
+
+    p = sub.add_parser("mvs", help="plane-sweep MVS + fusion: model + images -> fused PLY")
+    p.add_argument("model", type=Path)
+    p.add_argument("images", type=Path)
+    p.add_argument("--out", type=Path, required=True)
+    p.add_argument("--max-size", type=int, default=1600)
+    p.add_argument("--sources", type=int, default=4)
+    p.add_argument("--hypotheses", type=int, default=128)
+    p.add_argument("--window", type=int, default=7)
+    p.add_argument("--min-score", type=float, default=0.5, help="min winning mean ZNCC")
+    p.add_argument("--min-consistent", type=int, default=2)
+    p.add_argument("--voxel", type=float, default=0.05, help="fusion voxel size (model units)")
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--mesh", action="store_true", help="Poisson mesh (needs --extra mesh)")
+    p.add_argument("--poisson-depth", type=int, default=10)
+    p.set_defaults(handler=_mvs)
+
+    p = sub.add_parser("eval-geometry", help="P/R/F-score of a fused cloud vs a reference")
+    p.add_argument("prediction", type=Path, help="fused.npz or .ply (ENU)")
+    p.add_argument("--reference", type=Path, required=True, help=".laz/.las or ENU .ply/.npz")
+    p.add_argument("--georef", type=Path, help="georef.json (needed for LAS/LAZ references)")
+    p.add_argument("--thresholds", type=float, nargs="+", default=[0.05, 0.10, 0.20])
+    p.add_argument("--no-icp", action="store_true", help="skip ICP refinement")
+    p.add_argument("--out", type=Path, help="write metrics JSON here")
+    p.set_defaults(handler=_eval_geometry)
 
     args = parser.parse_args(argv)
     try:
