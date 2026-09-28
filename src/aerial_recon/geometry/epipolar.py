@@ -30,7 +30,13 @@ class RelativePose:
     F: np.ndarray | None = None
 
 
-def to_norm(x, K):  # noqa: N803
+def fit(idx):
+    return fundamental_eight_point(x1[idx], x2[idx])
+
+def residuals(F):
+    return sampson_distance(F, x1, x2)
+
+def to_norm(x, K):
     return (np.column_stack([x, np.ones(len(x))]) @ np.linalg.inv(K).T)[:, :2]
 
 
@@ -168,23 +174,13 @@ def estimate_relative_pose(
     against the homography model on nadir, flat-terrain pairs. When does the 8-point
     estimate break down?
     """
-    def fit(idx):
-        return fundamental_eight_point(x1[idx], x2[idx])
-
-    def residuals(F):  # noqa: N803
-        return sampson_distance(F, x1, x2)
-
     result = ransac(len(x1), 8, fit, residuals, threshold_px, confidence=confidence, rng=rng)
     F_best, inliers = result.model, result.inliers
-    if F_best is None:
-        return RelativePose(np.eye(3), np.array([0.0, 0.0, 1.0]), inliers, None)
 
-    E = essential_from_fundamental(F_best, K1, K2)
-    idx = np.flatnonzero(inliers)
-    xn1, xn2 = to_norm(x1[idx], K1), to_norm(x2[idx], K2)
+    E = decompose_essential(F_best)
+    R, t, _ = select_pose_by_cheirality(E)
+
+    xn1, xn2 = to_norm(x1[inliers], K1), to_norm(x2[inliers], K2)
     R, t, in_front = select_pose_by_cheirality(decompose_essential(E), xn1, xn2)
 
-    # Inliers must satisfy the epipolar constraint *and* cheirality.
-    final = np.zeros(len(x1), dtype=bool)
-    final[idx[in_front]] = True
-    return RelativePose(R, t, final, F_best)
+    return RelativePose(R, t, inliers, F_best)
