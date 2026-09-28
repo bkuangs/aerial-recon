@@ -374,6 +374,39 @@ def _eval_geometry(args: argparse.Namespace) -> int:
     return 0
 
 
+def _crosscheck(args: argparse.Namespace) -> int:
+    """No-reference check: SfM points vs the fused MVS cloud, in ground-sampling distances."""
+    import json
+
+    import numpy as np
+
+    from aerial_recon.eval.reference import sparse_dense_agreement
+    from aerial_recon.modern.pose_sources import load_poses
+    from aerial_recon.mvs.pipeline import ground_sampling_distance
+
+    recon = load_poses(args.model)
+    mvs = json.loads((args.mvs / "mvs.json").read_text())
+    width = mvs["resolution"][0]
+    cams = {i: recon.cameras[recon.images[i].camera_id].scaled(
+        width / recon.cameras[recon.images[i].camera_id].width)
+        for i in recon.registered_image_ids}
+    gsd = ground_sampling_distance(recon, cams)
+    dense = np.load(args.mvs / "fused.npz")["points"].astype(np.float64)
+    sparse = recon.points_array()
+    # The fused cloud is voxelised, so distances below ~half a voxel are not resolvable.
+    voxel_gsd = mvs["options"]["voxel_size"] / gsd
+    out = sparse_dense_agreement(sparse, dense, gsd, multiples=(2.0, 4.0, 8.0))
+    out["voxel_in_gsd"] = voxel_gsd
+    print(f"{out['num_sparse_in_footprint']}/{out['num_sparse']} SfM points in the dense "
+          f"footprint; distance to the fused cloud in GSD ({gsd:.4g} units at {width} px, "
+          f"voxel = {voxel_gsd:.1f} GSD): median {out['median']:.2f}, within 2/4/8 GSD "
+          f"{out['within_2']:.1%} / {out['within_4']:.1%} / {out['within_8']:.1%}")
+    if args.json:
+        args.json.parent.mkdir(parents=True, exist_ok=True)
+        args.json.write_text(json.dumps(out, indent=2))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="aerial-recon")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -497,6 +530,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--icp-scale", action="store_true", help="let ICP also fit a global scale")
     p.add_argument("--out", type=Path, help="write metrics JSON here")
     p.set_defaults(handler=_eval_geometry)
+
+    p = sub.add_parser("crosscheck", help="SfM points vs fused MVS cloud (no reference needed)")
+    p.add_argument("model", type=Path, help="COLMAP model the MVS ran on")
+    p.add_argument("mvs", type=Path, help="`aerial-recon mvs` output dir (fused.npz, mvs.json)")
+    p.add_argument("--json", type=Path, help="write the metrics here")
+    p.set_defaults(handler=_crosscheck)
 
     args = parser.parse_args(argv)
     try:

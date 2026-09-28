@@ -20,7 +20,7 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial import cKDTree
 
-from aerial_recon.eval.geometry import geometry_metrics_multi
+from aerial_recon.eval.geometry import geometry_metrics_multi, nearest_distances
 from aerial_recon.geo.geodesy import lla_to_enu
 from aerial_recon.geometry.alignment import Sim3, umeyama
 
@@ -126,3 +126,24 @@ def evaluate_against_reference(pred: np.ndarray, reference: np.ndarray,
         out["icp_aligned"] = {f"{t:g}": m for t, m in geometry_metrics_multi(
             aligned, reference, thresholds, cap_m).items()}
     return out
+
+
+def sparse_dense_agreement(sparse: np.ndarray, dense: np.ndarray, unit: float,
+                           multiples: tuple[float, ...] = (1.0, 2.0, 5.0),
+                           footprint_cell: float | None = None) -> dict:
+    """Reference-free check of a fused cloud: distance from each SfM point (triangulated
+    from keypoint tracks, independently of MVS) to the nearest dense point.
+
+    `unit` is the length the distances are reported in (e.g. the ground sampling distance,
+    so the numbers are roughly pixels). Sparse points outside the dense cloud's xy
+    footprint (cell `footprint_cell`, default 10 units) are not counted.
+    """
+    cell = footprint_cell if footprint_cell is not None else 10.0 * unit
+    inside = footprint_mask(sparse, dense, cell=cell)
+    d = nearest_distances(sparse[inside], dense, max_distance=100.0 * unit) / unit
+    return {
+        "unit": unit, "num_sparse": int(len(sparse)), "num_sparse_in_footprint": int(inside.sum()),
+        "num_dense": int(len(dense)), "median": float(np.median(d)),
+        "mean_capped_100": float(np.mean(d)),
+        **{f"within_{m:g}": float(np.mean(d <= m)) for m in multiples},
+    }

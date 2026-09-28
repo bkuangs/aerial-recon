@@ -150,3 +150,19 @@ def test_extract_keyframes_from_panning_video(tmp_path):
     assert all(p.exists() for p in paths)
     gaps = np.diff(stats["keyframes"])
     assert gaps.min() >= 9 and gaps.max() <= 13
+
+
+def test_sparse_dense_agreement_in_units():
+    from aerial_recon.eval.reference import sparse_dense_agreement
+
+    g = np.arange(0, 10, 0.1)
+    xx, yy = np.meshgrid(g, g)
+    dense = np.column_stack([xx.ravel(), yy.ravel(), np.zeros(xx.size)])
+    sparse = np.column_stack([np.full(4, 5.0), np.full(4, 5.0), [0.0, 0.1, 0.3, 0.6]])
+    far = np.array([[50.0, 50.0, 0.0]])  # outside the dense footprint: ignored
+    out = sparse_dense_agreement(np.vstack([sparse, far]), dense, unit=0.1,
+                                 multiples=(2.0, 4.0))
+    assert out["num_sparse_in_footprint"] == 4
+    assert out["median"] == pytest.approx(2.0)
+    assert out["within_2"] == pytest.approx(0.5)
+    assert out["within_4"] == pytest.approx(0.75)
