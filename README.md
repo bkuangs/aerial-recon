@@ -26,6 +26,74 @@ fusion). COLMAP runs alongside as the answer key.
 and put the effort into what aerial data demands: appearance changes, pose refinement,
 scale, and 8 GB of VRAM.
 
+## Results
+
+### Drone Video (no GPS)
+
+| [Roof](https://vimeo.com/1153105848) | [Warehouse](https://vimeo.com/481823336) |
+|---|---|
+| ![drone_roof_orbit, 10 s from 1:00](docs/media/drone_roof_orbit.gif) | ![warehouse_drone_orbit, 10 s from 1:00](docs/media/warehouse_drone_orbit.gif) |
+| ![drone_roof_orbit fused MVS cloud, turntable](docs/media/drone_roof_orbit_3d.gif) | ![warehouse_drone_orbit fused MVS cloud, turntable](docs/media/warehouse_drone_orbit_3d.gif) |
+
+*Top: 10 s of each input video from 1:00. Bottom: the fused MVS point cloud on a
+turntable, cropped to the drone's orbit.*
+
+| metric | Roof | Warehouse |
+|---|---|---|
+| input | 145 s, 2560×1440, 60 fps | 137 s, 2560×1440, 60 fps |
+| keyframes (`keyframes --target 180`) | 165, one per 0.87 s | 156, one per 0.85 s |
+| orbit coverage, camera pitch | 1.3 laps (471°), 45° down | 3.0 laps (1096°), 42° down |
+| SfM registered | 165 / 165 | 156 / 156 |
+| sparse points, mean track length | 138k, 10.0 | 55k, 6.7 |
+| mean reprojection error | 0.56 px | 0.72 px |
+| level: camera-height spread, max \|roll\| | 0.7 %, 1.2° | 4.8 %, 0.7° |
+| MVS valid depth per view (mean) | 88 % | 72 % |
+| median ZNCC of the winning depth | 0.86 | 0.63 |
+| fused points (voxel = 4 GSD) | 3.9M | 2.9M |
+| SfM point → dense cloud: median, ≤ 4 GSD, ≤ 8 GSD | 1.9 GSD, 95.1 %, 98.3 % | 1.9 GSD, 97.1 %, 99.0 % |
+| Poisson mesh, depth 10 | 1.4M vertices, 2.7M triangles | 2.9M vertices, 5.9M triangles |
+| CPU time: COLMAP, MVS depth + fusion | 13 min, 28 + 16 min | 8 min, 24 + 10 min |
+
+There is no ground truth for either video (no GPS, no LiDAR), so these are consistency
+checks, not accuracy. The last check (`aerial-recon crosscheck`) measures how far each
+COLMAP point, triangulated from feature tracks independently of MVS, is from the fused
+cloud, in ground-sampling distances (≈ pixels at 1600 px). The 1.9 GSD median sits near
+the floor that the 4 GSD voxel spacing allows. The warehouse scores lower on valid depth
+and ZNCC because of trees, which move and repeat.
+
+### Aerial Imagery
+
+| Brighton Beach (ODM, 18 photos) | Aukerman (ODM, 77 photos) |
+|---|---|
+| ![three of the Brighton Beach photos](docs/media/brighton_beach_photos.jpg) | ![three of the Aukerman photos](docs/media/aukerman_photos.jpg) |
+| ![Brighton Beach fused MVS cloud, turntable](docs/media/brighton_beach_3d.gif) | ![Aukerman fused MVS cloud, turntable](docs/media/aukerman_3d.gif) |
+
+*Top: three input photos from each set. Bottom: the fused MVS point cloud in GPS-aligned
+ENU metres on a turntable (Aukerman shows a random 6M of its 20M points). Both come from
+this repo's own pipeline: `sfm` (8-point) → `georef` → `mvs`.*
+
+| metric | Brighton Beach | Aukerman |
+|---|---|---|
+| input | 18 DJI photos, 4000×2250, EXIF GPS | 77 Sony photos, 4896×3672, EXIF GPS |
+| SfM registered | 18 / 18 | 76 / 77 |
+| sparse points, mean track length | 9.4k, 2.8 | 46k, 3.6 |
+| bundle adjustment reprojection RMSE | 0.87 px | 1.28 px |
+| poses vs COLMAP: ATE RMSE (Sim3-aligned) | 3.4 cm | 31 cm |
+| poses vs COLMAP: pairwise AUC @ 5°, median rot. / transl. error | 0.981, 0.08° / 0.06° | 0.950, 0.18° / 0.13° |
+| GPS residual RMSE after `georef` (COLMAP model) | 0.42 m (0.43 m) | 1.10 m (1.13 m) |
+| MVS resolution, valid depth per view, median ZNCC | 1600×900, 66 %, 0.60 | 1600×1200, 80 %, 0.68 |
+| fused points (voxel) | 2.3M (5 cm) | 20.4M (10 cm) |
+| SfM point → dense cloud: median, ≤ 2 GSD, ≤ 4 GSD | 0.78 GSD, 82.7 %, 94.8 % (GSD 4.2 cm) | 0.76 GSD, 73.8 %, 83.9 % (GSD 8.6 cm) |
+| COLMAP sparse → dense cloud after ICP: median, ≤ 10 cm | — | 5.6 cm, 83 % |
+| vs ODM `model.laz` after ICP: F-score @ 10 / 20 cm | 0.42 / 0.61 | — (no reference) |
+| CPU time: SfM, MVS depth + fusion | 39 s (cached features), 5 min | 92 min, 19 + 11 min |
+
+COLMAP is the pose reference, so the ATE is converted to metres with COLMAP's own GPS
+scale. The own-SfM model fits GPS as well as COLMAP's does (the values in brackets). The
+ODM cloud is photogrammetric too, so the F-score measures agreement, not accuracy. Before
+ICP, the EXIF altitude datum puts the cloud about 10 m below ODM's. On Brighton, most
+depth failures are in the tree canopy, which shows up as holes in the turntable.
+
 ## Bringup
 
 ```bash
@@ -64,14 +132,6 @@ Large clouds: add `--voxel 0.2` first (Aukerman: 20M -> 4.6M points, 4.5 GB peak
 on Brighton takes about 5.8 GB. Note that `uv sync --extra X` *removes* extras you don't
 list, so sync them together: `uv sync --extra colmap --extra dev --extra mesh`.
 
-### From a drone video (no GPS)
-
-| drone_roof_orbit | warehouse_drone_orbit |
-|---|---|
-| ![drone_roof_orbit, 10 s from 1:00](docs/media/drone_roof_orbit.gif) | ![warehouse_drone_orbit, 10 s from 1:00](docs/media/warehouse_drone_orbit.gif) |
-
-*10 s of each input video starting at 1:00 (360 px, 8 fps).*
-
 ```bash
 V=warehouse_drone_orbit; O=outputs/$V
 uv run aerial-recon keyframes data/video/$V --out data/$V/images --target 180   # M2
@@ -79,6 +139,7 @@ uv run aerial-recon colmap data/$V/images --out $O/colmap --max-size 1920
 uv run aerial-recon level $O/colmap/sparse_txt --out $O/colmap_level            # z-up, centred
 uv run aerial-recon mvs $O/colmap_level data/$V/images --out $O/mvs --voxel 0
 uv run aerial-recon mesh $O/mvs/fused.npz --depth 10 --out $O/mvs/mesh_d10.ply
+uv run aerial-recon crosscheck $O/colmap_level $O/mvs --json $O/mvs/crosscheck.json
 ```
 
 `keyframes` scores every frame (Laplacian sharpness, LK median flow at 640 px), sets the
