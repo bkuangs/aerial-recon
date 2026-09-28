@@ -213,7 +213,7 @@ src/aerial_recon/
   eval/              pose, geometry, image metrics
 tests/scaffold/      passes now
 tests/student/       one file per milestone — your gates
-docs/                roadmap, theory, datasets, conventions, study design
+docs/                roadmap, theory, datasets, conventions, study design, optimizations
 ```
 
 ## Hardware notes (this machine)
