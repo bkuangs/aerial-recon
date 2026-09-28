@@ -54,7 +54,9 @@ uv run aerial-recon eval-geometry $B/mvs_sfm_8pt/fused.npz --reference data/brig
 
 `--cache` stores keypoints and all raw matches, so reruns (and `--sequential N` subsets)
 skip feature extraction and matching. `eval-geometry` reports metrics after GPS alignment
-and after ICP refinement, cropped to the reference footprint.
+and after ICP refinement, cropped to the reference footprint. Pick `mvs --voxel` close to
+the ground sampling distance at the MVS resolution (Brighton 4 cm → 0.05; Aukerman 9 cm →
+0.1): finer voxels only multiply memory. `mvs --reuse-depth` resumes after a fusion crash.
 
 ## How to work a milestone
 
