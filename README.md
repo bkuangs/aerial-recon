@@ -58,6 +58,12 @@ and after ICP refinement, cropped to the reference footprint. Pick `mvs --voxel`
 the ground sampling distance at the MVS resolution (Brighton 4 cm → 0.05; Aukerman 9 cm →
 0.1): finer voxels only multiply memory. `mvs --reuse-depth` resumes after a fusion crash.
 
+Mesh an existing cloud with `uv run aerial-recon mesh $B/mvs_sfm_8pt/fused.npz` (needs
+`--extra mesh`; outlier removal, screened Poisson at depth 11, then density trimming).
+Large clouds: add `--voxel 0.2` first (Aukerman: 20M -> 4.6M points, 4.5 GB peak). Depth 12
+on Brighton takes about 5.8 GB. Note that `uv sync --extra X` *removes* extras you don't
+list, so sync them together: `uv sync --extra colmap --extra dev --extra mesh`.
+
 ## How to work a milestone
 
 1. Read the milestone in [docs/roadmap.md](docs/roadmap.md) and its reading in

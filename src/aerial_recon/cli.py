@@ -247,18 +247,45 @@ def _mvs(args: argparse.Namespace) -> int:
     print(f"{summary['num_points']} fused points from {summary['num_views']} views in "
           f"{summary['seconds']:.0f}s -> {args.out / 'fused.ply'}")
     if args.mesh:
-        try:
-            import numpy as np
-
-            from aerial_recon.mvs.meshing import poisson_mesh, write_mesh
-        except ImportError:
-            print("meshing needs open3d: uv sync --extra mesh", file=sys.stderr)
-            return 1
-        data = np.load(args.out / "fused.npz")
-        mesh = poisson_mesh(data["points"], data["colors"], depth=args.poisson_depth)
-        write_mesh(args.out / "mesh.ply", mesh)
-        print(f"mesh -> {args.out / 'mesh.ply'}")
+        return _mesh_cloud(args.out / "fused.npz", args.out / "mesh.ply", depth=args.poisson_depth)
     return 0
+
+
+def _mesh_cloud(cloud: Path, out: Path, depth: int = 11, voxel: float | None = None,
+                trim: float = 0.05, outlier_std: float | None = 2.0) -> int:
+    try:
+        import numpy as np
+
+        from aerial_recon.mvs.fusion import voxel_downsample
+        from aerial_recon.mvs.meshing import poisson_mesh, write_mesh
+    except ImportError:
+        print("meshing needs open3d: uv sync --extra mesh", file=sys.stderr)
+        return 1
+    data = np.load(cloud)
+    points, colors = data["points"].astype(np.float64), data["colors"].astype(np.float64)
+    print(f"loaded {len(points)} points from {cloud}")
+    if voxel:
+        points, colors = voxel_downsample(points, colors, voxel)
+        print(f"voxel {voxel:g} -> {len(points)} points")
+    if outlier_std:
+        import open3d as o3d
+
+        pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
+        _, keep = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=outlier_std)
+        keep = np.asarray(keep)
+        print(f"statistical outlier removal kept {len(keep)}/{len(points)} points")
+        points, colors = points[keep], colors[keep]
+    mesh = poisson_mesh(points, colors, depth=depth, density_quantile=trim)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    write_mesh(out, mesh)
+    print(f"{len(mesh.vertices)} vertices, {len(mesh.triangles)} triangles -> {out}")
+    return 0
+
+
+def _mesh(args: argparse.Namespace) -> int:
+    out = args.out or args.cloud.with_name("mesh.ply")
+    return _mesh_cloud(args.cloud, out, depth=args.depth, voxel=args.voxel, trim=args.trim,
+                       outlier_std=None if args.no_outlier_removal else args.outlier_std)
 
 
 def _load_points(path: Path):
@@ -387,8 +414,20 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--reuse-depth", action="store_true",
                    help="reuse depth maps already in OUT/depth (e.g. after a crash in fusion)")
     p.add_argument("--mesh", action="store_true", help="Poisson mesh (needs --extra mesh)")
-    p.add_argument("--poisson-depth", type=int, default=10)
+    p.add_argument("--poisson-depth", type=int, default=11)
     p.set_defaults(handler=_mvs)
+
+    p = sub.add_parser("mesh", help="Poisson mesh of an existing fused.npz (needs --extra mesh)")
+    p.add_argument("cloud", type=Path, help="fused.npz from `aerial-recon mvs`")
+    p.add_argument("--out", type=Path, help="output mesh (default: mesh.ply next to the cloud)")
+    p.add_argument("--depth", type=int, default=11, help="Poisson octree depth")
+    p.add_argument("--voxel", type=float, help="downsample the cloud first (model units)")
+    p.add_argument("--trim", type=float, default=0.05,
+                   help="drop vertices below this density quantile (removes invented surface)")
+    p.add_argument("--outlier-std", type=float, default=2.0,
+                   help="statistical outlier removal std ratio (20 neighbours)")
+    p.add_argument("--no-outlier-removal", action="store_true")
+    p.set_defaults(handler=_mesh)
 
     p = sub.add_parser("eval-geometry", help="P/R/F-score of a fused cloud vs a reference")
     p.add_argument("prediction", type=Path, help="fused.npz or .ply (ENU)")
