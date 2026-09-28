@@ -147,29 +147,43 @@ class _VoxelAccumulator:
     def __init__(self, voxel_size: float) -> None:
         self.voxel_size = voxel_size
         self.keys = np.zeros(0, dtype=np.int64)
-        self.sums: np.ndarray | None = None
-        self.counts = np.zeros(0, dtype=np.int64)
+        self.sums: np.ndarray | None = None  # float64 point sums, float32 color sums
+        self.counts = np.zeros(0, dtype=np.int32)
 
     def add(self, points: np.ndarray, colors: np.ndarray | None) -> None:
         if len(points) == 0:
             return
-        vals = points if colors is None else np.column_stack([points, colors])
-        keys = np.concatenate([self.keys, _voxel_keys(points, self.voxel_size)])
-        vals = vals if self.sums is None else np.concatenate([self.sums, vals])
-        counts = np.concatenate([self.counts, np.ones(len(points), dtype=np.int64)])
-        self.keys, inverse = np.unique(keys, return_inverse=True)
+        # Reduce the new points on their own first, then merge with the running totals, so
+        # the large arrays are only concatenated once per view.
+        keys, vals, counts = self._reduce(_voxel_keys(points, self.voxel_size), points,
+                                          colors, np.ones(len(points), dtype=np.int32))
+        if self.sums is not None:
+            keys = np.concatenate([self.keys, keys])
+            vals = [np.concatenate([a, b]) for a, b in zip(self.sums, vals, strict=True)]
+            counts = np.concatenate([self.counts, counts])
+            keys, vals, counts = self._reduce(keys, vals[0], vals[1], counts)
+        self.keys, self.sums, self.counts = keys, vals, counts
+
+    @staticmethod
+    def _reduce(keys, points, colors, counts):
+        uniq, inverse = np.unique(keys, return_inverse=True)
         inverse = inverse.ravel()
-        self.counts = np.bincount(inverse, weights=counts,
-                                  minlength=len(self.keys)).astype(np.int64)
-        self.sums = np.column_stack([np.bincount(inverse, weights=vals[:, c],
-                                                 minlength=len(self.keys))
-                                     for c in range(vals.shape[1])])
+        n = len(uniq)
+        pts = np.column_stack([np.bincount(inverse, weights=points[:, c], minlength=n)
+                               for c in range(3)])
+        cols = None
+        if colors is not None:
+            cols = np.column_stack([np.bincount(inverse, weights=colors[:, c], minlength=n)
+                                    for c in range(colors.shape[1])]).astype(np.float32)
+        cnt = np.bincount(inverse, weights=counts, minlength=n).astype(np.int32)
+        return uniq, [pts, cols], cnt
 
     def result(self) -> tuple[np.ndarray, np.ndarray | None]:
         if self.sums is None:
             return np.zeros((0, 3)), None
-        mean = self.sums / self.counts[:, None]
-        return mean[:, :3], (mean[:, 3:] if mean.shape[1] > 3 else None)
+        pts, cols = self.sums
+        n = self.counts[:, None]
+        return pts / n, (None if cols is None else cols / n)
 
 
 def voxel_downsample(

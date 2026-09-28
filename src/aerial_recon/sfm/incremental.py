@@ -57,8 +57,12 @@ class SfMOptions:
     seed: int = 0
     # Initial pair: prefer pairs whose median inlier triangulation angle is at least this.
     init_min_triangulation_angle_deg: float = 4.0
-    # Try this many initial pairs and keep the model with the most registered images.
+    # Try this many initial pairs and keep the model with the most registered images...
     max_init_attempts: int = 3
+    # ...but stop once a model registers at least this fraction of the images (another
+    # initial pair rarely rescues a weakly connected leftover, and each attempt is a full
+    # reconstruction).
+    good_enough_fraction: float = 0.95
     verbose: bool = False
 
 
@@ -127,7 +131,8 @@ class IncrementalSfM:
             self._log(f"init {pair}: {recon.summary()}")
             if best is None or len(recon.registered_image_ids) > len(best.registered_image_ids):
                 best = recon
-            if len(best.registered_image_ids) == len(self.images):
+            if len(best.registered_image_ids) >= self.options.good_enough_fraction * len(
+                    self.images):
                 break
         if best is None:
             best = Reconstruction(cameras=dict(self.cameras), images=self._fresh_images())

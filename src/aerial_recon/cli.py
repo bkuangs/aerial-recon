@@ -241,7 +241,8 @@ def _mvs(args: argparse.Namespace) -> int:
     opt = MVSOptions(max_image_size=args.max_size, num_sources=args.sources,
                      depth_hypotheses=args.hypotheses, window=args.window,
                      min_score=args.min_score, min_consistent=args.min_consistent,
-                     voxel_size=args.voxel, workers=args.workers)
+                     voxel_size=args.voxel, workers=args.workers,
+                     reuse_depth=args.reuse_depth)
     summary = run_mvs(recon, args.images, args.out, opt)
     print(f"{summary['num_points']} fused points from {summary['num_views']} views in "
           f"{summary['seconds']:.0f}s -> {args.out / 'fused.ply'}")
@@ -383,6 +384,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--min-consistent", type=int, default=2)
     p.add_argument("--voxel", type=float, default=0.05, help="fusion voxel size (model units)")
     p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--reuse-depth", action="store_true",
+                   help="reuse depth maps already in OUT/depth (e.g. after a crash in fusion)")
     p.add_argument("--mesh", action="store_true", help="Poisson mesh (needs --extra mesh)")
     p.add_argument("--poisson-depth", type=int, default=10)
     p.set_defaults(handler=_mvs)

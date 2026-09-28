@@ -38,6 +38,7 @@ class MVSOptions:
     max_relative_depth: float = 0.01
     voxel_size: float = 0.05
     workers: int = 4
+    reuse_depth: bool = False  # load depth/<name>.npz from a previous run instead of sweeping
 
 
 def undistort_image(image: np.ndarray, camera: Camera) -> tuple[np.ndarray, Camera]:
@@ -158,21 +159,37 @@ def run_mvs(recon: Reconstruction, image_dir: str | Path, out_dir: str | Path,
                      [cams[j] for j in srcs], [poses[j] for j in srcs], depths, opt.window))
         job_ids.append(iid)
 
+    def depth_path(iid: int) -> Path:
+        return out_dir / "depth" / f"{Path(recon.images[iid].name).stem}.npz"
+
+    def results():
+        todo = [(i, j) for i, j in zip(job_ids, jobs, strict=True)
+                if not (opt.reuse_depth and depth_path(i).exists())]
+        swept = _bounded_map(_sweep_job, [j for _, j in todo], opt.workers)
+        todo_ids = {i for i, _ in todo}
+        for iid in job_ids:
+            if iid in todo_ids:
+                depth, score = next(swept)
+                np.savez_compressed(depth_path(iid), depth=depth, score=score)
+                yield iid, depth, score
+            else:
+                data = np.load(depth_path(iid))
+                yield iid, data["depth"], data["score"]
+
     depth_maps: dict[int, np.ndarray] = {}
     stats = {}
-    for iid, (depth, score) in zip(job_ids, _bounded_map(_sweep_job, jobs, opt.workers),
-                                   strict=True):
+    for iid, depth, score in results():
         lo, hi = ranges[iid]
         keep = (score > opt.min_score) & (depth > lo * 1.001) & (depth < hi * 0.999)
         filtered = np.where(keep, depth, 0.0).astype(np.float32)
         depth_maps[iid] = filtered
-        np.savez_compressed(out_dir / "depth" / f"{Path(recon.images[iid].name).stem}.npz",
-                            depth=depth, score=score)
         stats[recon.images[iid].name] = {"valid_fraction": float(keep.mean()),
                                          "median_score": float(np.median(score))}
         log(f"  depth {recon.images[iid].name}: {keep.mean():.1%} valid "
             f"({time.time() - t0:.0f}s)")
 
+    jobs.clear()  # fusion only needs depth, cameras, poses, and colors
+    grays.clear()
     order = [i for i in ids if i in depth_maps]
     index = {iid: n for n, iid in enumerate(order)}
     fusion_nb = [[index[j] for j in neighbors[i][:opt.fusion_neighbors] if j in index]
