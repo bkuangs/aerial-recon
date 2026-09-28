@@ -37,7 +37,24 @@ uv run aerial-recon colmap data/brighton_beach/images --out outputs/brighton_bea
 ```
 
 Optional extras: `--extra mesh` (Open3D Poisson meshing, M9), `--extra splat` (torch +
-gsplat, M11), `--extra eval` (LPIPS, plots).
+gsplat, M11), `--extra eval` (LPIPS, plots, and `laspy`/`pyproj` for LAZ references).
+
+### Classical pipeline end to end (M6–M9)
+
+```bash
+B=outputs/brighton_beach
+uv run aerial-recon sfm data/brighton_beach/images --intrinsics $B/colmap/sparse_txt \
+    --out $B/sfm_8pt --cache $B/features_1600_8k.npz          # add --five-point / --focal-from-exif
+uv run aerial-recon compare-poses $B/sfm_8pt $B/colmap/sparse_txt --json $B/sfm_8pt/pose_metrics.json
+uv run aerial-recon georef $B/sfm_8pt data/brighton_beach/images --out $B/sfm_8pt_enu
+uv run aerial-recon mvs $B/sfm_8pt_enu data/brighton_beach/images --out $B/mvs_sfm_8pt [--mesh]
+uv run aerial-recon eval-geometry $B/mvs_sfm_8pt/fused.npz --reference data/brighton_beach/model.laz \
+    --georef $B/sfm_8pt_enu/georef.json --out $B/mvs_sfm_8pt/geometry_metrics.json
+```
+
+`--cache` stores keypoints and all raw matches, so reruns (and `--sequential N` subsets)
+skip feature extraction and matching. `eval-geometry` reports metrics after GPS alignment
+and after ICP refinement, cropped to the reference footprint.
 
 ## How to work a milestone
 

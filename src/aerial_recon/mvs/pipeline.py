@@ -123,8 +123,11 @@ def _sweep_job(args):
 
 
 def run_mvs(recon: Reconstruction, image_dir: str | Path, out_dir: str | Path,
-            options: MVSOptions | None = None, log=print) -> dict:
+            options: MVSOptions | None = None, log=None) -> dict:
     opt = options or MVSOptions()
+    if log is None:
+        def log(msg: str) -> None:
+            print(msg, flush=True)
     image_dir, out_dir = Path(image_dir), Path(out_dir)
     (out_dir / "depth").mkdir(parents=True, exist_ok=True)
     t0 = time.time()

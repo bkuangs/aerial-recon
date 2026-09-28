@@ -101,6 +101,21 @@ def _sfm(args: argparse.Namespace) -> int:
     camera = next(iter(ref.cameras.values()))
     paths = sorted(p for p in Path(args.images).iterdir()
                    if p.suffix.lower() in {".jpg", ".jpeg", ".png"})
+    focal = args.focal
+    if args.focal_from_exif:
+        from aerial_recon.io.exif import read_focal_px
+
+        focal = read_focal_px(paths[0])
+        if focal is None:
+            print("no usable EXIF focal length (add the camera to exif.SENSOR_WIDTH_MM)",
+                  file=sys.stderr)
+            return 2
+    if focal is not None:
+        from aerial_recon.types import Camera
+
+        # COLMAP's distortion was fit jointly with its focal, so it is dropped here.
+        print(f"intrinsics override: f = {focal:.1f} px (COLMAP {camera.fx:.1f}), k1 = k2 = 0")
+        camera = Camera(camera.width, camera.height, focal, focal, camera.cx, camera.cy)
     images, descriptors = {}, {}
     cache = args.cache
     cached = None
@@ -272,14 +287,15 @@ def _eval_geometry(args: argparse.Namespace) -> int:
     else:
         reference = _load_points(args.reference)
     metrics = evaluate_against_reference(pred, reference, args.thresholds,
-                                         use_icp=not args.no_icp)
+                                         use_icp=not args.no_icp, icp_scale=args.icp_scale)
+    print(f"median vertical offset (pred - reference) {metrics['median_vertical_offset_m']:+.2f} m")
     print(f"prediction {metrics['num_pred']} points ({metrics['num_pred_in_footprint']} in "
           f"reference footprint), reference {metrics['num_reference']} points")
     if "icp" in metrics:
         icp = metrics["icp"]
         print("ICP refinement of GPS alignment: translation "
               + " ".join(f"{v:+.2f}" for v in icp["translation_m"])
-              + f" m, rotation {icp['rotation_deg']:.3f}°")
+              + f" m, rotation {icp['rotation_deg']:.3f}°, scale {icp['scale']:.4f}")
     for key in ("gps_aligned", "icp_aligned"):
         if key not in metrics:
             continue
@@ -336,6 +352,11 @@ def main(argv: list[str] | None = None) -> int:
                    help="only match images within this index distance (0 = exhaustive)")
     p.add_argument("--cache", type=Path,
                    help="npz cache of keypoints + raw matches (created if missing)")
+    focal = p.add_mutually_exclusive_group()
+    focal.add_argument("--focal", type=float,
+                       help="override the focal length (px); distortion is set to 0")
+    focal.add_argument("--focal-from-exif", action="store_true",
+                       help="focal from EXIF FocalLength + sensor width; distortion set to 0")
     p.set_defaults(handler=_sfm)
 
     p = sub.add_parser("compare-poses", help="evaluate a COLMAP-format model against a reference")
@@ -372,6 +393,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--georef", type=Path, help="georef.json (needed for LAS/LAZ references)")
     p.add_argument("--thresholds", type=float, nargs="+", default=[0.05, 0.10, 0.20])
     p.add_argument("--no-icp", action="store_true", help="skip ICP refinement")
+    p.add_argument("--icp-scale", action="store_true", help="let ICP also fit a global scale")
     p.add_argument("--out", type=Path, help="write metrics JSON here")
     p.set_defaults(handler=_eval_geometry)
 
