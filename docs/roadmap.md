@@ -103,7 +103,12 @@ aerial-recon compare-poses outputs/brighton_beach/mine outputs/brighton_beach/co
 ```
 Target: 18/18 registered, median relative rotation error < 0.5° vs COLMAP. The reference
 solution got 0.19° and AUC@5° = 0.96 with `--five-point`, but only **2/18** with its own
-8-point verifier. Reproduce that gap and explain it (flat beach → degenerate F). Then
+8-point verifier. Reproduce that gap and explain it (flat beach → degenerate F).
+*Update from the full implementation:* most of that gap was actually the **12-unknown DLT
+PnP** degenerating on the near-planar beach (smallest/largest singular value of the
+registered structure is 1–3%), not the F-based verification. With a P3P minimal solver in
+`pnp_ransac` (the default now) the 8-point verifier also reaches 18/18 (median rotation
+error 0.08° vs COLMAP). Then
 implement Nistér's 5-point solver or a homography-aware initialization if you want to
 remove the OpenCV dependency.
 **Then:** Aukerman (77 images, nadir survey) with `--sequential 10` versus exhaustive matching.
@@ -140,6 +145,13 @@ recall, F-score). Meshing is scaffolded with Open3D Poisson (`--extra mesh`).
 reference: Brighton Beach ships ODM's `model.laz` (a pseudo-reference, not ground truth).
 For true ground truth use ETH3D or UrbanScene3D ([datasets.md](datasets.md)).
 **Deliverable:** A CLI `mvs` subcommand you add yourself: model + images → fused PLY + mesh.
+(Done: `aerial-recon mvs`, then `aerial-recon eval-geometry` against `model.laz`.)
+**Pitfall (Brighton):** COLMAP self-calibrates the FC300S focal ~19% long (2782 px vs
+~2340 px from EXIF + sensor width). Reprojection error cannot tell them apart on this
+scene, but the reconstructed flying height can: with COLMAP's focal the ground lands 46 m
+below the cameras vs the 39.9 m RelativeAltitude, i.e. a ~10 m vertical offset against
+ODM's cloud. `sfm --focal-from-exif` fixes the height but, with distortion dropped, adds a
+bowl; the real fix is self-calibration (focal + k1, k2) with an EXIF prior.
 
 ---
 

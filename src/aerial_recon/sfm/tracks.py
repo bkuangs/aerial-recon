@@ -18,13 +18,30 @@ class UnionFind:
     """Disjoint-set forest with path compression and union by rank over hashable nodes."""
 
     def __init__(self) -> None:
-        raise NotImplementedError("M6: implement UnionFind")
+        self.parent: dict = {}
+        self.rank: dict = {}
 
     def find(self, x):
-        raise NotImplementedError
+        if x not in self.parent:
+            self.parent[x] = x
+            self.rank[x] = 0
+            return x
+        root = x
+        while self.parent[root] != root:
+            root = self.parent[root]
+        while self.parent[x] != root:  # path compression
+            self.parent[x], x = root, self.parent[x]
+        return root
 
     def union(self, a, b) -> None:
-        raise NotImplementedError
+        ra, rb = self.find(a), self.find(b)
+        if ra == rb:
+            return
+        if self.rank[ra] < self.rank[rb]:
+            ra, rb = rb, ra
+        self.parent[rb] = ra
+        if self.rank[ra] == self.rank[rb]:
+            self.rank[ra] += 1
 
 
 def build_tracks(
@@ -39,4 +56,21 @@ def build_tracks(
         keypoint per image, with length >= min_length. Tracks are sorted by their first
         element so the output is deterministic.
     """
-    raise NotImplementedError("M6: implement build_tracks")
+    uf = UnionFind()
+    for (a, b), m in matches.items():
+        for i, j in np.asarray(m, dtype=np.int64).reshape(-1, 2):
+            uf.union((int(a), int(i)), (int(b), int(j)))
+
+    components: dict = {}
+    for node in list(uf.parent):
+        components.setdefault(uf.find(node), []).append(node)
+
+    tracks = []
+    for nodes in components.values():
+        images = [image_id for image_id, _ in nodes]
+        if len(images) != len(set(images)):  # conflicting track: drop it
+            continue
+        if len(nodes) >= min_length:
+            tracks.append(sorted(nodes))
+    tracks.sort(key=lambda t: t[0])
+    return tracks

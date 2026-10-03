@@ -20,7 +20,12 @@ dependencies = [
 colmap = ["pycolmap>=3.11"]
 mesh = ["open3d>=0.18"]
 splat = ["torch>=2.4", "gsplat>=1.5"]
-eval = ["lpips>=0.1.4", "matplotlib>=3.9"]
+eval = [
+    "laspy[lazrs]>=2.5",
+    "lpips>=0.1.4",
+    "matplotlib>=3.9",
+    "pyproj>=3.6",
+]
 dev = ["pytest>=8.0", "ruff>=0.6"]
 
 [project.scripts]

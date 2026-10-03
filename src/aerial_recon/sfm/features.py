@@ -71,8 +71,11 @@ def match_descriptors(
     d2 = aa + bb - 2 * desc_a @ desc_b.T       # (Na, Nb)
     d = np.sqrt(np.maximum(d2, 0))             # clamp tiny negatives from rounding
 
-    nn = np.argsort(d, axis=1)[:, :2]
+    # Two nearest neighbours in O(Nb) per row (a full argsort is O(Nb log Nb)).
+    nn = np.argpartition(d, 1, axis=1)[:, :2]
     rows = np.arange(len(desc_a))
+    swap = d[rows, nn[:, 0]] > d[rows, nn[:, 1]]
+    nn[swap] = nn[swap][:, ::-1]
     d1, d2nd = d[rows, nn[:, 0]], d[rows, nn[:, 1]]
     keep = d1 < ratio * d2nd
     j = nn[:, 0]

@@ -77,6 +77,22 @@ def _extract_frames(args: argparse.Namespace) -> int:
     return 0
 
 
+def _keyframes(args: argparse.Namespace) -> int:
+    """M2 deliverable: video -> sharp, parallax-spaced keyframes for SfM."""
+    import json
+
+    from aerial_recon.video.frames import extract_keyframes
+
+    paths, stats = extract_keyframes(args.video, args.out, target=args.target,
+                                     min_displacement=args.min_displacement,
+                                     analysis_width=args.analysis_width,
+                                     resize_width=args.width, search_window=args.window,
+                                     stride=args.stride)
+    (args.out.parent / f"{args.out.name}_keyframes.json").write_text(json.dumps(stats, indent=2))
+    print(f"wrote {len(paths)} keyframes to {args.out}")
+    return 0
+
+
 def _colmap(args: argparse.Namespace) -> int:
     from aerial_recon.sfm.reference import run_colmap
 
@@ -101,29 +117,71 @@ def _sfm(args: argparse.Namespace) -> int:
     camera = next(iter(ref.cameras.values()))
     paths = sorted(p for p in Path(args.images).iterdir()
                    if p.suffix.lower() in {".jpg", ".jpeg", ".png"})
+    focal = args.focal
+    if args.focal_from_exif:
+        from aerial_recon.io.exif import read_focal_px
+
+        focal = read_focal_px(paths[0])
+        if focal is None:
+            print("no usable EXIF focal length (add the camera to exif.SENSOR_WIDTH_MM)",
+                  file=sys.stderr)
+            return 2
+    if focal is not None:
+        from aerial_recon.types import Camera
+
+        # COLMAP's distortion was fit jointly with its focal, so it is dropped here.
+        print(f"intrinsics override: f = {focal:.1f} px (COLMAP {camera.fx:.1f}), k1 = k2 = 0")
+        camera = Camera(camera.width, camera.height, focal, focal, camera.cx, camera.cy)
     images, descriptors = {}, {}
-    for image_id, path in enumerate(paths, start=1):
-        gray = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
-        factor = min(1.0, args.max_size / max(gray.shape))
-        if factor < 1.0:
-            gray = cv2.resize(gray, None, fx=factor, fy=factor, interpolation=cv2.INTER_AREA)
-        kps, desc = detect_sift(gray, max_features=args.max_features)
-        images[image_id] = Image(image_id, 1, path.name, keypoints=kps / factor)
-        descriptors[image_id] = root_sift(desc)
-        print(f"[{image_id}/{len(paths)}] {path.name}: {len(kps)} features", flush=True)
+    cache = args.cache
+    cached = None
+    if cache is not None and cache.exists():
+        cached = np.load(cache, allow_pickle=False)
+        if [str(n) for n in cached["names"]] != [p.name for p in paths]:
+            print(f"cache {cache} is for a different image set; ignoring it")
+            cached = None
+    if cached is not None:
+        for image_id, path in enumerate(paths, start=1):
+            images[image_id] = Image(image_id, 1, path.name,
+                                     keypoints=cached[f"kp_{image_id}"])
+        print(f"loaded keypoints for {len(paths)} images from {cache}")
+    else:
+        for image_id, path in enumerate(paths, start=1):
+            gray = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+            factor = min(1.0, args.max_size / max(gray.shape))
+            if factor < 1.0:
+                gray = cv2.resize(gray, None, fx=factor, fy=factor,
+                                  interpolation=cv2.INTER_AREA)
+            kps, desc = detect_sift(gray, max_features=args.max_features)
+            images[image_id] = Image(image_id, 1, path.name, keypoints=kps / factor)
+            descriptors[image_id] = root_sift(desc)
+            print(f"[{image_id}/{len(paths)}] {path.name}: {len(kps)} features", flush=True)
 
     ids = sorted(images)
     pairs = [(a, b) for i, a in enumerate(ids) for b in ids[i + 1:]
              if args.sequential <= 0 or b - a <= args.sequential]
     matches = {}
-    for a, b in pairs:
-        m = match_descriptors(descriptors[a], descriptors[b])
-        if len(m) >= 15:
-            matches[(a, b)] = m
+    if cached is not None:
+        for a, b in pairs:
+            key = f"m_{a}_{b}"
+            if key in cached:
+                matches[(a, b)] = cached[key]
+    else:
+        for n, (a, b) in enumerate(pairs, start=1):
+            m = match_descriptors(descriptors[a], descriptors[b])
+            if len(m) >= 15:
+                matches[(a, b)] = m
+            if n % 100 == 0:
+                print(f"  matched {n}/{len(pairs)} pairs", flush=True)
+        if cache is not None:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(cache, names=np.array([p.name for p in paths]),
+                                **{f"kp_{i}": images[i].keypoints for i in ids},
+                                **{f"m_{a}_{b}": m for (a, b), m in matches.items()})
     print(f"{len(matches)} / {len(pairs)} pairs with >= 15 matches")
     solver = "five_point_opencv" if args.five_point else "eight_point"
     recon = IncrementalSfM({1: camera}, images, matches,
-                           SfMOptions(relative_pose_solver=solver)).run()
+                           SfMOptions(relative_pose_solver=solver, verbose=True)).run()
     write_model(recon, args.out)
     print(recon.summary())
     print(f"mean inlier matches per pair: {np.mean([len(m) for m in matches.values()]):.0f}")
@@ -152,6 +210,200 @@ def _compare_poses(args: argparse.Namespace) -> int:
     print("pairwise AUC " + "  ".join(f"@{t:g}°={a:.3f}" for t, a in zip(thresholds, aucs,
                                                                           strict=True)))
     print(f"median rotation error {np.median(rot):.3f}°, translation {np.median(trans):.3f}°")
+    if args.json:
+        import json
+
+        payload = {
+            "registered_estimate": len(est_by_name), "registered_reference": len(ref_by_name),
+            "common": len(common), "ate_rmse": ate.rmse, "ate_median": ate.median,
+            "ate_max": ate.max, "sim3_scale": ate.scale,
+            "auc": {f"{t:g}": a for t, a in zip(thresholds, aucs, strict=True)},
+            "median_rotation_error_deg": float(np.median(rot)),
+            "median_translation_error_deg": float(np.median(trans)),
+        }
+        args.json.parent.mkdir(parents=True, exist_ok=True)
+        args.json.write_text(json.dumps(payload, indent=2))
+    return 0
+
+
+def _georef(args: argparse.Namespace) -> int:
+    """M7 gate: EXIF GPS -> ENU -> Sim3 from camera centers."""
+    from aerial_recon.geo.georef import georeference, write_georef
+    from aerial_recon.io.colmap_text import write_model
+    from aerial_recon.modern.pose_sources import load_poses
+
+    recon = load_poses(args.model)
+    result = georeference(recon, args.images)
+    write_model(recon, args.out)
+    summary = write_georef(result, args.out / "georef.json")
+    print(f"georeferenced {summary['num_images']} images, scale {summary['scale']:.4f}")
+    print(f"GPS residuals: rmse 3D {summary['rmse_3d_m']:.2f} m, horizontal "
+          f"{summary['rmse_horizontal_m']:.2f} m, vertical {summary['rmse_vertical_m']:.2f} m, "
+          f"max {summary['max_3d_m']:.2f} m")
+    slope = summary.get("vertical_residual_vs_radius_slope")
+    if slope is not None:
+        print(f"vertical residual vs radius slope {slope:+.4f} m/m (doming check), planar "
+              f"trend R² (E, N, U) = "
+              + ", ".join(f"{v:.2f}" for v in summary["residual_planar_trend_r2_enu"]))
+    return 0
+
+
+def _level(args: argparse.Namespace) -> int:
+    """No-GPS alternative to georef: z-up from camera roll ≈ 0, origin at the scene."""
+    import json
+
+    from aerial_recon.geo.level import level_reconstruction
+    from aerial_recon.io.colmap_text import write_model
+    from aerial_recon.modern.pose_sources import load_poses
+
+    recon = load_poses(args.model)
+    summary = level_reconstruction(recon, scale=args.scale)
+    write_model(recon, args.out)
+    (args.out / "level.json").write_text(json.dumps(summary, indent=2))
+    print(f"levelled {summary['num_images']} images: camera height "
+          f"{summary['median_camera_height']:.3f} (std {summary['camera_height_std']:.3f}), "
+          f"|roll| median {summary['median_abs_roll_deg']:.2f}° max "
+          f"{summary['max_abs_roll_deg']:.2f}°")
+    return 0
+
+
+def _mvs(args: argparse.Namespace) -> int:
+    """M8-M9 deliverable: model + images -> depth maps -> fused PLY (+ Poisson mesh)."""
+    from aerial_recon.modern.pose_sources import load_poses
+    from aerial_recon.mvs.pipeline import MVSOptions, run_mvs
+
+    recon = load_poses(args.model)
+    opt = MVSOptions(max_image_size=args.max_size, num_sources=args.sources,
+                     depth_hypotheses=args.hypotheses, window=args.window,
+                     min_score=args.min_score, min_consistent=args.min_consistent,
+                     voxel_size=args.voxel, auto_voxel_gsd=args.auto_voxel_gsd,
+                     workers=args.workers,
+                     reuse_depth=args.reuse_depth)
+    summary = run_mvs(recon, args.images, args.out, opt)
+    print(f"{summary['num_points']} fused points from {summary['num_views']} views in "
+          f"{summary['seconds']:.0f}s -> {args.out / 'fused.ply'}")
+    if args.mesh:
+        return _mesh_cloud(args.out / "fused.npz", args.out / "mesh.ply", depth=args.poisson_depth)
+    return 0
+
+
+def _mesh_cloud(cloud: Path, out: Path, depth: int = 11, voxel: float | None = None,
+                trim: float = 0.05, outlier_std: float | None = 2.0) -> int:
+    try:
+        import numpy as np
+
+        from aerial_recon.mvs.fusion import voxel_downsample
+        from aerial_recon.mvs.meshing import poisson_mesh, write_mesh
+    except ImportError:
+        print("meshing needs open3d: uv sync --extra mesh", file=sys.stderr)
+        return 1
+    data = np.load(cloud)
+    points, colors = data["points"].astype(np.float64), data["colors"].astype(np.float64)
+    print(f"loaded {len(points)} points from {cloud}")
+    if voxel:
+        points, colors = voxel_downsample(points, colors, voxel)
+        print(f"voxel {voxel:g} -> {len(points)} points")
+    if outlier_std:
+        import open3d as o3d
+
+        pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
+        _, keep = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=outlier_std)
+        keep = np.asarray(keep)
+        print(f"statistical outlier removal kept {len(keep)}/{len(points)} points")
+        points, colors = points[keep], colors[keep]
+    mesh = poisson_mesh(points, colors, depth=depth, density_quantile=trim)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    write_mesh(out, mesh)
+    print(f"{len(mesh.vertices)} vertices, {len(mesh.triangles)} triangles -> {out}")
+    return 0
+
+
+def _mesh(args: argparse.Namespace) -> int:
+    out = args.out or args.cloud.with_name("mesh.ply")
+    return _mesh_cloud(args.cloud, out, depth=args.depth, voxel=args.voxel, trim=args.trim,
+                       outlier_std=None if args.no_outlier_removal else args.outlier_std)
+
+
+def _load_points(path: Path):
+    import numpy as np
+
+    from aerial_recon.io.ply import read_ply_points
+
+    if path.suffix == ".npz":
+        return np.load(path)["points"].astype(np.float64)
+    return read_ply_points(path)
+
+
+def _eval_geometry(args: argparse.Namespace) -> int:
+    """M9 gate: precision / recall / F-score of a fused cloud against a reference."""
+    import json
+
+    from aerial_recon.eval.reference import evaluate_against_reference, load_laz_enu
+    from aerial_recon.geo.georef import read_ref_lla
+
+    pred = _load_points(args.prediction)
+    if args.reference.suffix.lower() in {".laz", ".las"}:
+        if args.georef is None:
+            print("--georef georef.json is required to put a LAS/LAZ reference in ENU",
+                  file=sys.stderr)
+            return 2
+        reference, _ = load_laz_enu(args.reference, read_ref_lla(args.georef))
+    else:
+        reference = _load_points(args.reference)
+    metrics = evaluate_against_reference(pred, reference, args.thresholds,
+                                         use_icp=not args.no_icp, icp_scale=args.icp_scale)
+    print(f"median vertical offset (pred - reference) {metrics['median_vertical_offset_m']:+.2f} m")
+    print(f"prediction {metrics['num_pred']} points ({metrics['num_pred_in_footprint']} in "
+          f"reference footprint), reference {metrics['num_reference']} points")
+    if "icp" in metrics:
+        icp = metrics["icp"]
+        print("ICP refinement of GPS alignment: translation "
+              + " ".join(f"{v:+.2f}" for v in icp["translation_m"])
+              + f" m, rotation {icp['rotation_deg']:.3f}°, scale {icp['scale']:.4f}")
+    for key in ("gps_aligned", "icp_aligned"):
+        if key not in metrics:
+            continue
+        print(f"{key}:")
+        for tau, m in metrics[key].items():
+            print(f"  τ={float(tau) * 100:>4.0f} cm  P {m['precision']:.3f}  R {m['recall']:.3f}  "
+                  f"F {m['fscore']:.3f}  acc {m['accuracy']:.3f} m  "
+                  f"comp {m['completeness']:.3f} m")
+    if args.out:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(json.dumps(metrics, indent=2))
+    return 0
+
+
+def _crosscheck(args: argparse.Namespace) -> int:
+    """No-reference check: SfM points vs the fused MVS cloud, in ground-sampling distances."""
+    import json
+
+    import numpy as np
+
+    from aerial_recon.eval.reference import sparse_dense_agreement
+    from aerial_recon.modern.pose_sources import load_poses
+    from aerial_recon.mvs.pipeline import ground_sampling_distance
+
+    recon = load_poses(args.model)
+    mvs = json.loads((args.mvs / "mvs.json").read_text())
+    width = mvs["resolution"][0]
+    cams = {i: recon.cameras[recon.images[i].camera_id].scaled(
+        width / recon.cameras[recon.images[i].camera_id].width)
+        for i in recon.registered_image_ids}
+    gsd = ground_sampling_distance(recon, cams)
+    dense = np.load(args.mvs / "fused.npz")["points"].astype(np.float64)
+    sparse = recon.points_array()
+    # The fused cloud is voxelised, so distances below ~half a voxel are not resolvable.
+    voxel_gsd = mvs["options"]["voxel_size"] / gsd
+    out = sparse_dense_agreement(sparse, dense, gsd, multiples=(2.0, 4.0, 8.0))
+    out["voxel_in_gsd"] = voxel_gsd
+    print(f"{out['num_sparse_in_footprint']}/{out['num_sparse']} SfM points in the dense "
+          f"footprint; distance to the fused cloud in GSD ({gsd:.4g} units at {width} px, "
+          f"voxel = {voxel_gsd:.1f} GSD): median {out['median']:.2f}, within 2/4/8 GSD "
+          f"{out['within_2']:.1%} / {out['within_4']:.1%} / {out['within_8']:.1%}")
+    if args.json:
+        args.json.parent.mkdir(parents=True, exist_ok=True)
+        args.json.write_text(json.dumps(out, indent=2))
     return 0
 
 
@@ -175,6 +427,20 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--width", type=int, help="resize frames to this width")
     p.set_defaults(handler=_extract_frames)
 
+    p = sub.add_parser("keyframes", help="video -> sharp keyframes spaced by parallax (M2)")
+    p.add_argument("video", type=Path)
+    p.add_argument("--out", type=Path, required=True)
+    motion = p.add_mutually_exclusive_group()
+    motion.add_argument("--target", type=int, default=150,
+                        help="approximate number of keyframes (sets the motion threshold)")
+    motion.add_argument("--min-displacement", type=float,
+                        help="motion between keyframes in px at --analysis-width")
+    p.add_argument("--analysis-width", type=int, default=640)
+    p.add_argument("--width", type=int, default=1920, help="output width (downscale only)")
+    p.add_argument("--window", type=int, default=9, help="sharpest-frame search window")
+    p.add_argument("--stride", type=int, default=1, help="analyse every n-th frame")
+    p.set_defaults(handler=_keyframes)
+
     p = sub.add_parser("colmap", help="reference reconstruction with COLMAP / GLOMAP")
     p.add_argument("images", type=Path)
     p.add_argument("--out", type=Path, required=True)
@@ -195,12 +461,81 @@ def main(argv: list[str] | None = None) -> int:
                    help="use OpenCV's 5-point essential solver for pair verification")
     p.add_argument("--sequential", type=int, default=0,
                    help="only match images within this index distance (0 = exhaustive)")
+    p.add_argument("--cache", type=Path,
+                   help="npz cache of keypoints + raw matches (created if missing)")
+    focal = p.add_mutually_exclusive_group()
+    focal.add_argument("--focal", type=float,
+                       help="override the focal length (px); distortion is set to 0")
+    focal.add_argument("--focal-from-exif", action="store_true",
+                       help="focal from EXIF FocalLength + sensor width; distortion set to 0")
     p.set_defaults(handler=_sfm)
 
     p = sub.add_parser("compare-poses", help="evaluate a COLMAP-format model against a reference")
     p.add_argument("estimate", type=Path)
     p.add_argument("reference", type=Path)
+    p.add_argument("--json", type=Path, help="also write the metrics to this JSON file")
     p.set_defaults(handler=_compare_poses)
+
+    p = sub.add_parser("georef", help="GPS-align a model into local ENU metres (M7 gate)")
+    p.add_argument("model", type=Path, help="COLMAP-format model (text or binary)")
+    p.add_argument("images", type=Path, help="image directory with EXIF GPS")
+    p.add_argument("--out", type=Path, required=True)
+    p.set_defaults(handler=_georef)
+
+    p = sub.add_parser("level", help="z-up + centre a model without GPS (e.g. video frames)")
+    p.add_argument("model", type=Path, help="COLMAP-format model (text or binary)")
+    p.add_argument("--out", type=Path, required=True)
+    p.add_argument("--scale", type=float, default=1.0, help="multiply the model by this")
+    p.set_defaults(handler=_level)
+
+    p = sub.add_parser("mvs", help="plane-sweep MVS + fusion: model + images -> fused PLY")
+    p.add_argument("model", type=Path)
+    p.add_argument("images", type=Path)
+    p.add_argument("--out", type=Path, required=True)
+    p.add_argument("--max-size", type=int, default=1600)
+    p.add_argument("--sources", type=int, default=4)
+    p.add_argument("--hypotheses", type=int, default=128)
+    p.add_argument("--window", type=int, default=7)
+    p.add_argument("--min-score", type=float, default=0.5, help="min winning mean ZNCC")
+    p.add_argument("--min-consistent", type=int, default=2)
+    p.add_argument("--voxel", type=float, default=0.05,
+                   help="fusion voxel size (model units); <= 0 = auto from the GSD")
+    p.add_argument("--auto-voxel-gsd", type=float, default=4.0,
+                   help="auto voxel = this x median ground sampling distance (--voxel 0)")
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--reuse-depth", action="store_true",
+                   help="reuse depth maps already in OUT/depth (e.g. after a crash in fusion)")
+    p.add_argument("--mesh", action="store_true", help="Poisson mesh (needs --extra mesh)")
+    p.add_argument("--poisson-depth", type=int, default=11)
+    p.set_defaults(handler=_mvs)
+
+    p = sub.add_parser("mesh", help="Poisson mesh of an existing fused.npz (needs --extra mesh)")
+    p.add_argument("cloud", type=Path, help="fused.npz from `aerial-recon mvs`")
+    p.add_argument("--out", type=Path, help="output mesh (default: mesh.ply next to the cloud)")
+    p.add_argument("--depth", type=int, default=11, help="Poisson octree depth")
+    p.add_argument("--voxel", type=float, help="downsample the cloud first (model units)")
+    p.add_argument("--trim", type=float, default=0.05,
+                   help="drop vertices below this density quantile (removes invented surface)")
+    p.add_argument("--outlier-std", type=float, default=2.0,
+                   help="statistical outlier removal std ratio (20 neighbours)")
+    p.add_argument("--no-outlier-removal", action="store_true")
+    p.set_defaults(handler=_mesh)
+
+    p = sub.add_parser("eval-geometry", help="P/R/F-score of a fused cloud vs a reference")
+    p.add_argument("prediction", type=Path, help="fused.npz or .ply (ENU)")
+    p.add_argument("--reference", type=Path, required=True, help=".laz/.las or ENU .ply/.npz")
+    p.add_argument("--georef", type=Path, help="georef.json (needed for LAS/LAZ references)")
+    p.add_argument("--thresholds", type=float, nargs="+", default=[0.05, 0.10, 0.20])
+    p.add_argument("--no-icp", action="store_true", help="skip ICP refinement")
+    p.add_argument("--icp-scale", action="store_true", help="let ICP also fit a global scale")
+    p.add_argument("--out", type=Path, help="write metrics JSON here")
+    p.set_defaults(handler=_eval_geometry)
+
+    p = sub.add_parser("crosscheck", help="SfM points vs fused MVS cloud (no reference needed)")
+    p.add_argument("model", type=Path, help="COLMAP model the MVS ran on")
+    p.add_argument("mvs", type=Path, help="`aerial-recon mvs` output dir (fused.npz, mvs.json)")
+    p.add_argument("--json", type=Path, help="write the metrics here")
+    p.set_defaults(handler=_crosscheck)
 
     args = parser.parse_args(argv)
     try:
