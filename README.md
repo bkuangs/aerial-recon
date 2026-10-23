@@ -1,37 +1,17 @@
 # 3D Reconstruction from Drone Footage
 
-**Goal** Implement 3D reconstruction for aerial drone imagery by building the classical and modern pipelines (classical SfM, then 3DGS)
-from first principles, then comparing them on the same scenes.
+**Goal:** Implement the dense 3D scene reconstruction pipeline using aerial imagery. Start from classical (SfM) then try modern pipelines (3DGS) and compare them on the same scenes.
 
-```mermaid
-flowchart LR
-  V[video / photos] --> K[keyframes<br/>M2]
-  K --> F[features + matching<br/>M3]
-  F --> SFM[incremental SfM<br/>M4-M6]
-  SFM --> G[georeference<br/>M7]
-  G --> MVS[plane-sweep MVS<br/>M8]
-  MVS --> FU[fusion + mesh<br/>M9]
-  K --> LP[learned poses<br/>VGGT / MASt3R, M10]
-  G --> GS[3D Gaussian Splatting<br/>M11]
-  LP --> GS
-  GS --> GG[geometry from splats<br/>M12]
-  FU --> S{{comparison study<br/>M13}}
-  GG --> S
-```
-
-### Pipelines
-
-**Classical:** Structure-from-Motion with plane sweep multi-view stereo: SO(3), epipolar geometry,
+- **Classical:** Structure-from-Motion with plane sweep multi-view stereo: SO(3), epipolar geometry,
 RANSAC, triangulation, bundle adjustment, PnP, incremental mapping, plane sweep, and depth
-fusion. COLMAP runs alongside as the answer key.  
-
-**Modern:** Use off-the-shelf learned pose estimators and the `gsplat` library,
-and put the effort into what aerial data demands: appearance changes, pose refinement,
+fusion.
+- **Modern:** Use off-the-shelf learned pose estimators and the `gsplat` library,
+putting effort into downstream challenges: appearance changes, pose refinement,
 scale, and 8 GB of VRAM.
 
 ## Results
 
-### Stock Drone Footage (no GPS)
+### Stock Drone Footage
 
 Orbital drone footage was found on Vimeo and downloaded at 1440p.
 
@@ -49,12 +29,10 @@ Orbital drone footage was found on Vimeo and downloaded at 1440p.
 | sparse points, mean track length | 138k, 10.0 | 55k, 6.7 |
 | mean reprojection error | 0.56 px | 0.72 px |
 | MVS valid depth per view (mean) | 88 % | 72 % |
-| fused points (voxel = 4 GSD) | 3.9M | 2.9M |
 | Poisson mesh, octree depth 10 | 1.4M vertices, 2.7M triangles | 2.9M vertices, 5.9M triangles |
-| CPU time: COLMAP, MVS depth + fusion | 13 min, 28 + 16 min | 8 min, 24 + 10 min |
 
-There's no ground truth for either video (no GPS, no LiDAR), so the metrics primarily measure 
-consistency rather than accuracy.
+No ground truth for either video (no GPS/LiDAR), so metrics primarily measure 
+consistency instead of accuracy.
 
 ### Aerial Imagery
 
@@ -72,66 +50,9 @@ consistency rather than accuracy.
 | camera position error vs COLMAP | 3.4 cm | 31 cm |
 | GPS error after georeferencing (COLMAP) | 0.42 m (0.43 m) | 1.10 m (1.13 m) |
 | MVS valid depth per view (mean) | 66 % | 80 % |
-| fused points (voxel) | 2.3M (5 cm) | 20.4M (10 cm) |
 | agreement with ODM's cloud (F-score @ 20 cm) | 0.61 | — |
-| CPU time: SfM, MVS depth + fusion | 39 s (cached features), 5 min | 92 min, 19 + 11 min |
 
-COLMAP is used as the reference for camera poses. The GPS error matches COLMAP's model (in brackets).
-The F-score is computed against OpenDroneMap's point cloud (agreement, not accuracy). Most of Brighton's missing depth is in the tree canopy, which shows up as holes in the reconstruction.
-
-## Bringup
-
-```bash
-uv sync --extra colmap --extra dev          # core + pycolmap reference + pytest
-uv run pytest tests/scaffold                # infrastructure: passes out of the box
-uv run aerial-recon status                  # milestone progress (student tests)
-uv run aerial-recon download brighton_beach # 18 DJI images, ~80 MB
-uv run aerial-recon colmap data/brighton_beach/images --out outputs/brighton_beach/colmap
-```
-
-### Classical Pipeline (M6–M9)
-
-Photos (with GPS):
-
-```bash
-B=outputs/brighton_beach
-uv run aerial-recon sfm data/brighton_beach/images --intrinsics $B/colmap/sparse_txt \
-    --out $B/sfm_8pt --cache $B/features_1600_8k.npz
-uv run aerial-recon compare-poses $B/sfm_8pt $B/colmap/sparse_txt
-uv run aerial-recon georef $B/sfm_8pt data/brighton_beach/images --out $B/sfm_8pt_enu
-uv run aerial-recon mvs $B/sfm_8pt_enu data/brighton_beach/images --out $B/mvs_sfm_8pt --voxel 0.05
-uv run aerial-recon mesh $B/mvs_sfm_8pt/fused.npz                   # needs --extra mesh
-```
-
-Video (no GPS) (`level` replaces `georef`; `--voxel 0` picks 4 GSD automatically):
-
-```bash
-V=warehouse_drone_orbit; O=outputs/$V
-uv run aerial-recon keyframes data/video/$V --out data/$V/images --target 180
-uv run aerial-recon colmap data/$V/images --out $O/colmap --max-size 1920
-uv run aerial-recon level $O/colmap/sparse_txt --out $O/colmap_level
-uv run aerial-recon mvs $O/colmap_level data/$V/images --out $O/mvs --voxel 0
-uv run aerial-recon mesh $O/mvs/fused.npz --depth 10
-```
-
-`uv sync --extra X` removes extras you don't list, so sync them together:
-`uv sync --extra colmap --extra dev --extra mesh`.
-
-## How to work a milestone
-
-1. Read the milestone in [docs/roadmap.md](docs/roadmap.md) and its reading in
-   [docs/theory.md](docs/theory.md).
-2. Open the stub modules listed for it. Each docstring states the contract, the math, and
-   the traps.
-3. `uv run pytest tests/student -k m03 -x` until it is green. The tests use synthetic
-   scenes with exact ground truth ([synthetic.py](src/aerial_recon/synthetic.py)).
-4. Run the milestone's real-data gate, e.g. `aerial-recon sfm` → `aerial-recon compare-poses`
-   against COLMAP.
-5. Write down what surprised you. The study write-up is built from these notes.
-
-Every student test has been checked against a private reference implementation, including
-the real-data SfM gate on Brighton Beach. Slow end-to-end tests are marked `slow`
-(`aerial-recon status --fast` skips them).
+We use COLMAP as the reference for camera poses. GPS error matches COLMAP's model, F-score is computed against OpenDroneMap's point cloud for agreement. 
 
 ## Milestones
 
@@ -152,6 +73,18 @@ the real-data SfM gate on Brighton Beach. Slow end-to-end tests are marked `slow
 | M12 | Geometry from splats | depth render → fusion / 2DGS | F-score vs MVS |
 | M13 | Comparison study | configs + write-up | [docs/study.md](docs/study.md) |
 
+### How to work one
+
+1. Read the milestone in [docs/roadmap.md](docs/roadmap.md) and its reading in
+   [docs/theory.md](docs/theory.md).
+2. Open the stub modules listed for it. Each docstring states the contract, the math, and
+   the traps.
+3. `uv run pytest tests/student -k m03 -x` until it is green. The tests use synthetic
+   scenes with exact ground truth ([synthetic.py](src/aerial_recon/synthetic.py)).
+4. Run the milestone's real-data gate, e.g. `aerial-recon sfm` → `aerial-recon compare-poses`
+   against COLMAP.
+5. Write down what surprised you. The study write-up is built from these notes.
+
 ## Layout
 
 ```
@@ -171,10 +104,3 @@ tests/scaffold/      passes now
 tests/student/       one file per milestone — your gates
 docs/                roadmap, theory, datasets, conventions, study design, optimizations
 ```
-
-## Hardware notes (this machine)
-
-RTX 3060 Ti with 8 GB, and about 7.7 GB of RAM visible to WSL. If the Windows host has
-more RAM, raise the WSL limit in `%UserProfile%\.wslconfig` (`[wsl2]` / `memory=16GB`)
-before M9–M11. Defaults are sized for this machine: SfM at 1600 px, 8k features, 3DGS at
-¼ resolution.
